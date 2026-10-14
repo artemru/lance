@@ -4875,7 +4875,6 @@ dependencies = [
  "async-trait",
  "bitvec",
  "bytes",
- "cc",
  "chrono",
  "criterion",
  "crossbeam-queue",

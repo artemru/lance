@@ -4124,7 +4124,6 @@ dependencies = [
  "async-trait",
  "bitvec",
  "bytes",
- "cc",
  "crossbeam-queue",
  "datafusion",
  "datafusion-common",

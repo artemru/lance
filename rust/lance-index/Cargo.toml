@@ -108,7 +108,6 @@ test-oracle = []
 [build-dependencies]
 prost-build.workspace = true
 protobuf-src = { workspace = true, optional = true }
-cc = "1.0.83"
 
 [package.metadata.docs.rs]
 # docs.rs uses an older version of Ubuntu that does not have the necessary protoc version

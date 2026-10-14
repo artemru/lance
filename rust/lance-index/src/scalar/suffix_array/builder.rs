@@ -1,16 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Suffix array construction using libsais (Ilya Grebnov).
+//! Suffix array construction.
 //!
-//! Uses the vendored libsais C library for O(N) suffix array construction.
-//! libsais implements the SA-IS algorithm with extensive SIMD optimizations
-//! and cache-aware memory access patterns, achieving state-of-the-art
-//! performance (~3-5× faster than a naive Rust SA-IS implementation).
-//!
-//! This is the same class of algorithm used by the original infini-gram
-//! paper (which used libdivsufsort). libsais is the modern successor,
-//! typically 2× faster than libdivsufsort.
+//! Uses `libsais-rs`, the libsais SA-IS implementation that the FM-index also
+//! builds on, for O(N) construction.
 //!
 //! Memory usage: approximately 5×N for an N-byte input:
 //!   - input data: N bytes (borrowed, not copied)
@@ -18,25 +12,9 @@
 
 use lance_core::{Error, Result};
 
-// FFI binding to vendored libsais C library (compiled via build.rs)
-unsafe extern "C" {
-    /// Constructs the suffix array of a given byte string.
-    /// T: input bytes [0..n-1]
-    /// SA: output suffix array [0..n-1+fs]
-    /// n: length of input
-    /// fs: extra space at end of SA (0 is enough for most cases)
-    /// freq: optional output frequency table (NULL if not needed)
-    /// Returns 0 on success, -1 or -2 on error.
-    fn libsais(T: *const u8, SA: *mut i32, n: i32, fs: i32, freq: *mut i32) -> i32;
-}
-
-/// Build a suffix array for byte data using libsais.
+/// Build the suffix array of `data`: suffix start positions in sorted order.
 ///
-/// Uses Ilya Grebnov's libsais library — the fastest known implementation
-/// of the SA-IS algorithm with SIMD optimizations. Runs in O(N) time.
-///
-/// Returns an array of u32 starting positions sorted by their corresponding
-/// suffixes. Since segments are limited to < 2 GB (i32::MAX), u32 pointers suffice.
+/// Segments are limited to < 2 GB (i32::MAX), so u32 pointers suffice.
 pub fn build_suffix_array(data: &[u8]) -> Vec<u32> {
     let n = data.len();
     if n == 0 {
@@ -52,27 +30,14 @@ pub fn build_suffix_array(data: &[u8]) -> Vec<u32> {
     );
 
     let mut sa: Vec<i32> = vec![0i32; n];
-
-    let ret = unsafe {
-        libsais(
-            data.as_ptr(),
-            sa.as_mut_ptr(),
-            n as i32,
-            0,                    // no extra space needed
-            std::ptr::null_mut(), // no frequency table needed
-        )
-    };
-
+    let ret = libsais_rs::libsais(data, &mut sa, 0, None);
     assert!(
         ret == 0,
         "libsais failed with error code {ret} for input of {n} bytes"
     );
 
-    // Convert i32 -> u32 (all values are non-negative positions 0..n-1)
-    // Safety: i32 and u32 have the same size and alignment, and all values
-    // are non-negative, so this is a safe transmute.
-    let sa_u32: Vec<u32> = sa.into_iter().map(|x| x as u32).collect();
-    sa_u32
+    // All values are non-negative positions in 0..n.
+    sa.into_iter().map(|x| x as u32).collect()
 }
 
 /// Naive O(N log N) suffix array construction (test reference).
