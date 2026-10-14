@@ -176,8 +176,6 @@ struct SegmentMeta {
     offsets_filename: Option<String>,
     /// File name for the row IDs (None for legacy indices without row ID support).
     row_ids_filename: Option<String>,
-    /// File name for the bloom filter (None for legacy indices).
-    bloom_filename: Option<String>,
     /// Eagerly-loaded bloom filter for fast segment skipping.
     /// Loaded at index open time (~128 KB per segment) so that `search_rows`
     /// can skip segments without loading the full ~1 GB segment data.
@@ -438,7 +436,6 @@ impl SuffixArrayIndex {
                 sa_filename: format!("segment_{i}_suffix_array.bin"),
                 offsets_filename: None,
                 row_ids_filename: None,
-                bloom_filename: None,
                 bloom_filter: None,
                 pointer_width: seg.pointer_width,
                 total_entries: seg.total_entries,
@@ -473,7 +470,6 @@ impl SuffixArrayIndex {
                 sa_filename: "suffix_array.bin".to_string(),
                 offsets_filename: None, // v0 has no offsets file
                 row_ids_filename: None, // v0 has no row IDs file
-                bloom_filename: None,   // v0 has no bloom filter
                 bloom_filter: None,
                 pointer_width,
                 total_entries,
@@ -547,7 +543,6 @@ impl SuffixArrayIndex {
                 sa_filename: format!("segment_{i}_suffix_array.bin"),
                 offsets_filename: Some(format!("segment_{i}_doc_offsets.bin")),
                 row_ids_filename: Some(format!("segment_{i}_row_ids.bin")),
-                bloom_filename: Some(bloom_filename),
                 bloom_filter,
                 pointer_width: info.pointer_width as u8,
                 total_entries: info.total_entries,
@@ -822,7 +817,7 @@ impl SuffixArrayIndex {
                 break;
             };
             for byte_pos in pointers {
-                if (byte_pos as usize) % tw == 0 {
+                if (byte_pos as usize).is_multiple_of(tw) {
                     seg_total += 1;
                 }
             }
@@ -867,7 +862,7 @@ impl SuffixArrayIndex {
         };
 
         for byte_pos in positions {
-            if tw > 1 && (byte_pos as usize) % tw != 0 {
+            if tw > 1 && !(byte_pos as usize).is_multiple_of(tw) {
                 continue;
             }
             let local_doc = seg.doc_offsets.partition_point(|&o| o <= byte_pos);
@@ -940,7 +935,7 @@ impl SuffixArrayIndex {
         let active_metas: Vec<&SegmentMeta> = self.segment_metas.iter()
             .filter(|meta| {
                 meta.bloom_filter.as_ref()
-                    .map_or(true, |bf| bf.might_contain_substring_aligned(query, tw))
+                    .is_none_or(|bf| bf.might_contain_substring_aligned(query, tw))
             })
             .collect();
 
@@ -1051,11 +1046,11 @@ impl SuffixArrayIndex {
             let count = positions.len() as u32;
             if heap.len() < max_results {
                 heap.push(Reverse((count, *row_id)));
-            } else if let Some(&Reverse((min_count, _))) = heap.peek() {
-                if count > min_count {
-                    heap.pop();
-                    heap.push(Reverse((count, *row_id)));
-                }
+            } else if let Some(&Reverse((min_count, _))) = heap.peek()
+                && count > min_count
+            {
+                heap.pop();
+                heap.push(Reverse((count, *row_id)));
             }
         }
 
@@ -1138,11 +1133,11 @@ impl SuffixArrayIndex {
         for (row_id, (count, _)) in &result_map {
             if heap.len() < max_results {
                 heap.push(Reverse((*count, *row_id)));
-            } else if let Some(&Reverse((min_count, _))) = heap.peek() {
-                if *count > min_count {
-                    heap.pop();
-                    heap.push(Reverse((*count, *row_id)));
-                }
+            } else if let Some(&Reverse((min_count, _))) = heap.peek()
+                && *count > min_count
+            {
+                heap.pop();
+                heap.push(Reverse((*count, *row_id)));
             }
         }
 
@@ -1253,11 +1248,11 @@ impl SuffixArrayIndex {
         for (row_id, (count, _)) in &result_map {
             if heap.len() < max_results {
                 heap.push(Reverse((*count, *row_id)));
-            } else if let Some(&Reverse((min_count, _))) = heap.peek() {
-                if *count > min_count {
-                    heap.pop();
-                    heap.push(Reverse((*count, *row_id)));
-                }
+            } else if let Some(&Reverse((min_count, _))) = heap.peek()
+                && *count > min_count
+            {
+                heap.pop();
+                heap.push(Reverse((*count, *row_id)));
             }
         }
 
@@ -1485,7 +1480,7 @@ impl IndexStore for NoopIndexStore {
     }
 
     fn clone_arc(&self) -> Arc<dyn IndexStore> {
-        Arc::new(NoopIndexStore)
+        Arc::new(Self)
     }
 
     fn io_parallelism(&self) -> usize {

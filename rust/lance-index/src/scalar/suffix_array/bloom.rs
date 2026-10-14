@@ -41,17 +41,12 @@ impl BloomFilter {
         // ~10 bits per item, 7 hash functions → ~0.8% FPR
         let bits_needed = (expected_items as u64 * 10).max(8192); // min 1 KB
         let num_bits = bits_needed.min(2_097_152); // max 256 KB
-        let num_words = ((num_bits + 63) / 64) as usize;
+        let num_words = num_bits.div_ceil(64) as usize;
         Self {
             bits: vec![0u64; num_words],
             num_bits: num_words as u64 * 64,
             num_hashes: 7,
         }
-    }
-
-    /// Number of bits in the filter (for diagnostics).
-    pub fn num_bits(&self) -> u64 {
-        self.num_bits
     }
 
     /// Insert an item (byte slice) into the bloom filter.
@@ -92,6 +87,7 @@ impl BloomFilter {
     /// cannot appear in the segment.
     ///
     /// For queries shorter than NGRAM_SIZE, checks the query as a single item.
+    #[cfg(test)]
     pub fn might_contain_substring(&self, query: &[u8]) -> bool {
         self.might_contain_substring_aligned(query, 1)
     }
@@ -145,7 +141,7 @@ impl BloomFilter {
         }
         let num_hashes = u32::from_le_bytes(data[0..4].try_into().ok()?);
         let num_bits = u64::from_le_bytes(data[4..12].try_into().ok()?);
-        let num_words = ((num_bits + 63) / 64) as usize;
+        let num_words = num_bits.div_ceil(64) as usize;
         if data.len() < 12 + num_words * 8 {
             return None;
         }

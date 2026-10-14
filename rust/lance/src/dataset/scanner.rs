@@ -1271,10 +1271,10 @@ impl Scanner {
     /// The scanner will search the suffix array index for rows containing
     /// the given pattern and return those rows with a `_count` column.
     pub fn infgram_search(&mut self, query: InfgramSearchQuery) -> Result<&mut Self> {
-        if let Some(ref col) = query.column {
-            if self.dataset.schema().field(col).is_none() {
-                return Err(Error::invalid_input(format!("Column {} not found", col)));
-            }
+        if let Some(ref col) = query.column
+            && self.dataset.schema().field(col).is_none()
+        {
+            return Err(Error::invalid_input(format!("Column {} not found", col)));
         }
         self.infgram_query = Some(query);
         Ok(self)

@@ -349,7 +349,7 @@ fn extract_token_list_bytes(
         }
     };
 
-    let sep = separator_token_id.unwrap_or_else(|| {
+    let sep = separator_token_id.unwrap_or({
         if token_width == 2 { 0xFFFF } else { 0xFFFF_FFFF }
     });
     let sep_bytes: Vec<u8> = sep.to_le_bytes()[..token_width].to_vec();
@@ -562,7 +562,7 @@ impl ScalarIndexPlugin for SuffixArrayIndexPlugin {
         };
 
         if token_width > 1 {
-            let sep = separator_token_id.unwrap_or_else(|| {
+            let sep = separator_token_id.unwrap_or({
                 if token_width == 2 { 0xFFFF } else { 0xFFFF_FFFF }
             });
             info!(
@@ -825,7 +825,7 @@ impl ScalarIndexPlugin for SuffixArrayIndexPlugin {
             tokenizer_name: None,
             vocab_size: None,
             separator_token_id: if token_width > 1 {
-                let sep = separator_token_id.unwrap_or_else(|| {
+                let sep = separator_token_id.unwrap_or({
                     if token_width == 2 { 0xFFFF } else { 0xFFFF_FFFF }
                 });
                 Some(sep)

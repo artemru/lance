@@ -208,6 +208,7 @@ pub struct NtdResult {
 ///
 /// This is `count(prompt + continuation) / count(prompt)`.
 /// If the prompt has zero occurrences, the probability is 0.
+#[cfg(test)]
 pub fn prob(
     tokenized: &[u8],
     sa: &[u8],
@@ -383,6 +384,7 @@ fn get_next_byte(
 /// 1. Try suffix lengths 1, 2, 4, 8, 16, ... until count drops to 0
 /// 2. Binary search between the last non-zero and first zero length
 /// 3. Compute prob() using the longest suffix with non-zero count
+#[cfg(test)]
 pub fn infgram_prob(
     tokenized: &[u8],
     sa: &[u8],
