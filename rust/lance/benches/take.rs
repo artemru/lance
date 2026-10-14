@@ -20,9 +20,9 @@ use lance_file::version::LanceFileVersion;
 use lance_io::ReadBatchParams;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
-use object_store::path::Path;
 #[cfg(target_os = "linux")]
-use pprof::criterion::{Output, PProfProfiler};
+use lance_testing::pprof::{Output, PProfProfiler};
+use object_store::path::Path;
 use rand::Rng;
 use std::sync::Arc;
 #[cfg(target_os = "linux")]
@@ -213,6 +213,7 @@ fn file_reader_take(
                             16,
                             FilterExpression::no_filter(),
                         )
+                        .await
                         .unwrap();
                     stream.fold(Vec::new(), |mut acc, item| async move {
                         acc.push(item);

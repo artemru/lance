@@ -27,14 +27,13 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
-use crate::frag_reuse::FragReuseIndex;
 use crate::pb;
 use crate::progress::IndexBuildProgress;
 use crate::scalar::expression::ScalarQueryParser;
 use crate::scalar::registry::{
-    ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
+    BasicTrainer, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
 };
-use crate::scalar::{CreatedIndex, IndexStore, ScalarIndex};
+use crate::scalar::{CreatedIndex, IndexStore, RowIdRemapper, ScalarIndex};
 
 use super::bloom::BloomFilter;
 use super::builder::{
@@ -473,11 +472,7 @@ fn extract_token_list_bytes(
 }
 
 #[async_trait]
-impl ScalarIndexPlugin for SuffixArrayIndexPlugin {
-    fn name(&self) -> &str {
-        "SuffixArray"
-    }
-
+impl BasicTrainer for SuffixArrayIndexPlugin {
     fn new_training_request(
         &self,
         params: &str,
@@ -515,22 +510,6 @@ impl ScalarIndexPlugin for SuffixArrayIndexPlugin {
             })?
         };
         Ok(Box::new(SuffixArrayTrainingRequest::new(build_params)))
-    }
-
-    fn provides_exact_answer(&self) -> bool {
-        true
-    }
-
-    fn version(&self) -> u32 {
-        SUFFIX_ARRAY_INDEX_VERSION
-    }
-
-    fn new_query_parser(
-        &self,
-        _index_name: String,
-        _index_details: &prost_types::Any,
-    ) -> Option<Box<dyn ScalarQueryParser>> {
-        None
     }
 
     async fn train_index(
@@ -883,15 +862,43 @@ impl ScalarIndexPlugin for SuffixArrayIndexPlugin {
         Ok(CreatedIndex {
             index_details,
             index_version: SUFFIX_ARRAY_INDEX_VERSION,
-            files: Some(index_store.list_files_with_sizes().await?),
+            files: index_store.list_files_with_sizes().await?,
         })
+    }
+}
+
+#[async_trait]
+impl ScalarIndexPlugin for SuffixArrayIndexPlugin {
+    fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
+        Some(self)
+    }
+
+    fn name(&self) -> &str {
+        "SuffixArray"
+    }
+
+    fn provides_exact_answer(&self) -> bool {
+        true
+    }
+
+    fn version(&self) -> u32 {
+        SUFFIX_ARRAY_INDEX_VERSION
+    }
+
+    fn new_query_parser(
+        &self,
+        _index_name: String,
+        _index_details: &prost_types::Any,
+    ) -> Option<Box<dyn ScalarQueryParser>> {
+        None
     }
 
     async fn load_index(
         &self,
         index_store: Arc<dyn IndexStore>,
         index_details: &prost_types::Any,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        _index_version: u32,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &lance_core::cache::LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
         let details = pb::SuffixArrayIndexDetails::decode(&*index_details.value)?;
@@ -947,10 +954,10 @@ mod tests {
     use bytes::Bytes;
     use datafusion::execution::SendableRecordBatchStream;
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-    use deepsize::DeepSizeOf;
     use futures::stream;
     use lance_core::Result;
     use lance_core::cache::LanceCache;
+    use lance_core::deepsize::DeepSizeOf;
     use lance_core::utils::tempfile::TempDir;
     use lance_io::object_store::ObjectStore;
 
@@ -958,7 +965,7 @@ mod tests {
     use crate::metrics::NoOpMetricsCollector;
     use crate::progress::NoopIndexBuildProgress;
     use crate::scalar::lance_format::LanceIndexStore;
-    use crate::scalar::registry::{ScalarIndexPlugin, VALUE_COLUMN_NAME};
+    use crate::scalar::registry::{BasicTrainer, ScalarIndexPlugin, VALUE_COLUMN_NAME};
     use crate::scalar::suffix_array::builder::{
         build_suffix_array, compact_suffix_array, compute_pointer_width,
     };
@@ -1016,7 +1023,13 @@ mod tests {
 
     async fn load(created: &CreatedIndex, store: Arc<dyn IndexStore>) -> Arc<dyn ScalarIndex> {
         SuffixArrayIndexPlugin
-            .load_index(store, &created.index_details, None, &LanceCache::no_cache())
+            .load_index(
+                store,
+                &created.index_details,
+                created.index_version,
+                None,
+                &LanceCache::no_cache(),
+            )
             .await
             .unwrap()
     }
@@ -1063,7 +1076,7 @@ mod tests {
     }
 
     impl DeepSizeOf for ReadOnlyStore {
-        fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+        fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
             0
         }
     }
@@ -1092,6 +1105,20 @@ mod tests {
             self.inner.io_parallelism()
         }
 
+        fn with_io_priority(&self, io_priority: u64) -> Arc<dyn IndexStore> {
+            Arc::new(Self {
+                inner: self.inner.with_io_priority(io_priority),
+                write_attempts: self.write_attempts.clone(),
+            })
+        }
+
+        fn with_io_buffer_size(&self, bytes: u64) -> Arc<dyn IndexStore> {
+            Arc::new(Self {
+                inner: self.inner.with_io_buffer_size(bytes),
+                write_attempts: self.write_attempts.clone(),
+            })
+        }
+
         async fn new_index_file(
             &self,
             name: &str,
@@ -1104,11 +1131,15 @@ mod tests {
             self.inner.open_index_file(name).await
         }
 
-        async fn copy_index_file(&self, name: &str, _dest_store: &dyn IndexStore) -> Result<()> {
+        async fn copy_index_file(
+            &self,
+            name: &str,
+            _dest_store: &dyn IndexStore,
+        ) -> Result<IndexFile> {
             Err(self.reject_write(name))
         }
 
-        async fn rename_index_file(&self, name: &str, _new_name: &str) -> Result<()> {
+        async fn rename_index_file(&self, name: &str, _new_name: &str) -> Result<IndexFile> {
             Err(self.reject_write(name))
         }
 
@@ -1439,7 +1470,7 @@ mod tests {
 
     #[test]
     fn test_plugin_rejects_invalid_field_type() {
-        use crate::scalar::registry::ScalarIndexPlugin;
+        use crate::scalar::registry::BasicTrainer;
         use arrow_schema::{DataType, Field};
 
         let plugin = super::SuffixArrayIndexPlugin;
@@ -1450,7 +1481,7 @@ mod tests {
 
     #[test]
     fn test_plugin_accepts_valid_field_types() {
-        use crate::scalar::registry::ScalarIndexPlugin;
+        use crate::scalar::registry::BasicTrainer;
         use arrow_schema::{DataType, Field};
 
         let plugin = super::SuffixArrayIndexPlugin;

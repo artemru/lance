@@ -10,6 +10,7 @@ use std::sync::Arc;
 use crate::exec::{LanceExecutionOptions, get_session_context};
 use crate::expr::safe_coerce_scalar;
 use crate::logical_expr::{coerce_filter_type_to_boolean, get_as_string_scalar_opt, resolve_expr};
+use crate::signed_zero::{normalize_zero_comparisons, rewrite_signed_zero_comparisons};
 use crate::sql::{parse_sql_expr, parse_sql_filter};
 use arrow::compute::CastOptions;
 use arrow_array::ListArray;
@@ -17,11 +18,12 @@ use arrow_buffer::OffsetBuffer;
 use arrow_cast::cast_with_options;
 use arrow_schema::{DataType as ArrowDataType, Field, SchemaRef, TimeUnit};
 use arrow_select::concat::concat;
+use datafusion::catalog::Session;
 use datafusion::common::DFSchema;
-use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion, TreeNodeVisitor};
+use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion, TreeNodeVisitor};
 use datafusion::config::ConfigOptions;
 use datafusion::error::Result as DFResult;
-use datafusion::execution::context::SessionState;
+use datafusion::execution::context::{SessionContext, SessionState};
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::planner::{ExprPlanner, PlannerResult, RawFieldAccessExpr};
 use datafusion::logical_expr::{
@@ -45,7 +47,7 @@ use datafusion::{
     scalar::ScalarValue,
 };
 use datafusion_functions::core::getfield::GetFieldFunc;
-use lance_core::datatypes::Schema;
+use lance_core::datatypes::{Schema, parse_field_path};
 use lance_core::error::LanceOptionExt;
 
 use chrono::Utc;
@@ -56,6 +58,31 @@ fn encode_jsonb(json_str: &str) -> Result<Expr> {
     let bytes = lance_arrow::json::encode_json(json_str)
         .map_err(|e| Error::invalid_input(format!("Failed to encode JSONB: {e}")))?;
     Ok(Expr::Literal(ScalarValue::LargeBinary(Some(bytes)), None))
+}
+
+// The escape in `LIKE/ILIKE ... ESCAPE '<char>'` must be exactly one character.
+// Reject empty or multi-character escape strings rather than silently treating
+// them as "no escape" or truncating to the first character.
+fn parse_like_escape_char(escape_char: &Option<ValueWithSpan>) -> Result<Option<char>> {
+    let Some(value) = escape_char else {
+        return Ok(None);
+    };
+    let ValueWithSpan {
+        value: Value::SingleQuotedString(escape),
+        ..
+    } = value
+    else {
+        return Err(Error::invalid_input(format!(
+            "Invalid escape character in LIKE expression. Expected a single character wrapped with single quotes, got {value}"
+        )));
+    };
+    let mut chars = escape.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), None) => Ok(Some(c)),
+        _ => Err(Error::invalid_input(format!(
+            "Invalid escape character in LIKE expression. Expected a single character, got '{escape}'"
+        ))),
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
@@ -72,10 +99,6 @@ impl CastListF16Udf {
 }
 
 impl ScalarUDFImpl for CastListF16Udf {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "_cast_list_f16"
     }
@@ -160,28 +183,39 @@ impl ScalarUDFImpl for CastListF16Udf {
 // Adapter that instructs datafusion how lance expects expressions to be interpreted
 struct LanceContextProvider {
     options: datafusion::config::ConfigOptions,
-    state: SessionState,
+    // Functions are looked up in the session's shared state rather than in a
+    // clone of it: planners are created several times per query, and cloning
+    // every function map and rule list for each one is a measurable share of
+    // CPU for short queries.
+    session: SessionContext,
     expr_planners: Vec<Arc<dyn ExprPlanner>>,
+}
+
+impl LanceContextProvider {
+    fn new(session: SessionContext) -> Self {
+        let expr_planners = session.state_ref().read().expr_planners().to_vec();
+        Self {
+            options: ConfigOptions::default(),
+            session,
+            expr_planners,
+        }
+    }
+
+    fn with_state<T>(&self, read: impl FnOnce(&SessionState) -> T) -> T {
+        read(&self.session.state_ref().read())
+    }
 }
 
 impl Default for LanceContextProvider {
     fn default() -> Self {
-        let ctx = get_session_context(&LanceExecutionOptions::default());
-        let state = ctx.state();
-        let expr_planners = state.expr_planners().to_vec();
-
-        Self {
-            options: ConfigOptions::default(),
-            state,
-            expr_planners,
-        }
+        Self::new(get_session_context(&LanceExecutionOptions::default()))
     }
 }
 
 impl ContextProvider for LanceContextProvider {
     fn get_table_source(
         &self,
-        name: datafusion::sql::TableReference,
+        name: datafusion::common::TableReference,
     ) -> DFResult<Arc<dyn datafusion::logical_expr::TableSource>> {
         Err(datafusion::error::DataFusionError::NotImplemented(format!(
             "Attempt to reference inner table {} not supported",
@@ -190,11 +224,18 @@ impl ContextProvider for LanceContextProvider {
     }
 
     fn get_aggregate_meta(&self, name: &str) -> Option<Arc<AggregateUDF>> {
-        self.state.aggregate_functions().get(name).cloned()
+        self.with_state(|state| state.aggregate_functions().get(name).cloned())
     }
 
     fn get_window_meta(&self, name: &str) -> Option<Arc<WindowUDF>> {
-        self.state.window_functions().get(name).cloned()
+        self.with_state(|state| state.window_functions().get(name).cloned())
+    }
+
+    fn get_higher_order_meta(
+        &self,
+        name: &str,
+    ) -> Option<Arc<datafusion::logical_expr::HigherOrderUDF>> {
+        self.with_state(|state| state.higher_order_functions().get(name).cloned())
     }
 
     fn get_function_meta(&self, f: &str) -> Option<Arc<ScalarUDF>> {
@@ -202,7 +243,7 @@ impl ContextProvider for LanceContextProvider {
             // TODO: cast should go thru CAST syntax instead of UDF
             // Going thru UDF makes it hard for the optimizer to find no-ops
             "_cast_list_f16" => Some(Arc::new(ScalarUDF::new_from_impl(CastListF16Udf::new()))),
-            _ => self.state.scalar_functions().get(f).cloned(),
+            _ => self.with_state(|state| state.scalar_functions().get(f).cloned()),
         }
     }
 
@@ -216,15 +257,19 @@ impl ContextProvider for LanceContextProvider {
     }
 
     fn udf_names(&self) -> Vec<String> {
-        self.state.scalar_functions().keys().cloned().collect()
+        self.with_state(|state| state.scalar_functions().keys().cloned().collect())
     }
 
     fn udaf_names(&self) -> Vec<String> {
-        self.state.aggregate_functions().keys().cloned().collect()
+        self.with_state(|state| state.aggregate_functions().keys().cloned().collect())
     }
 
     fn udwf_names(&self) -> Vec<String> {
-        self.state.window_functions().keys().cloned().collect()
+        self.with_state(|state| state.window_functions().keys().cloned().collect())
+    }
+
+    fn higher_order_function_names(&self) -> Vec<String> {
+        self.with_state(|state| state.higher_order_functions().keys().cloned().collect())
     }
 
     fn get_expr_planners(&self) -> &[Arc<dyn ExprPlanner>] {
@@ -321,6 +366,8 @@ impl Planner {
             BinaryOperator::NotEq => Operator::NotEq,
             BinaryOperator::And => Operator::And,
             BinaryOperator::Or => Operator::Or,
+            BinaryOperator::PGBitwiseShiftLeft => Operator::BitwiseShiftLeft,
+            BinaryOperator::PGBitwiseShiftRight => Operator::BitwiseShiftRight,
             _ => {
                 return Err(Error::invalid_input(format!(
                     "Operator {op} is not supported"
@@ -329,10 +376,82 @@ impl Planner {
         })
     }
 
+    fn is_logical_binary_op(op: &BinaryOperator) -> bool {
+        matches!(op, BinaryOperator::And | BinaryOperator::Or)
+    }
+
+    fn is_same_logical_binary_op(left: &BinaryOperator, right: &BinaryOperator) -> bool {
+        matches!(
+            (left, right),
+            (BinaryOperator::And, BinaryOperator::And) | (BinaryOperator::Or, BinaryOperator::Or)
+        )
+    }
+
+    fn flatten_logical_binary_exprs<'a>(
+        left: &'a SQLExpr,
+        op: &BinaryOperator,
+        right: &'a SQLExpr,
+    ) -> Vec<&'a SQLExpr> {
+        let mut leaves = Vec::new();
+        let mut stack = vec![right, left];
+
+        while let Some(expr) = stack.pop() {
+            match expr {
+                SQLExpr::BinaryOp {
+                    left,
+                    op: child_op,
+                    right,
+                } if Self::is_same_logical_binary_op(op, child_op) => {
+                    stack.push(right.as_ref());
+                    stack.push(left.as_ref());
+                }
+                _ => leaves.push(expr),
+            }
+        }
+
+        leaves
+    }
+
+    fn balanced_binary_expr(mut exprs: VecDeque<Expr>, op: Operator) -> Result<Expr> {
+        if exprs.is_empty() {
+            return Err(Error::invalid_input("Binary expression has no operands"));
+        }
+
+        while exprs.len() > 1 {
+            let mut next = VecDeque::with_capacity(exprs.len().div_ceil(2));
+            while let Some(left) = exprs.pop_front() {
+                if let Some(right) = exprs.pop_front() {
+                    next.push_back(Expr::BinaryExpr(BinaryExpr::new(
+                        Box::new(left),
+                        op,
+                        Box::new(right),
+                    )));
+                } else {
+                    next.push_back(left);
+                }
+            }
+            exprs = next;
+        }
+
+        exprs
+            .pop_front()
+            .ok_or_else(|| Error::invalid_input("Binary expression has no operands"))
+    }
+
     fn binary_expr(&self, left: &SQLExpr, op: &BinaryOperator, right: &SQLExpr) -> Result<Expr> {
+        let df_op = self.binary_op(op)?;
+        if Self::is_logical_binary_op(op) {
+            let leaves = Self::flatten_logical_binary_exprs(left, op, right);
+            let mut exprs = VecDeque::with_capacity(leaves.len());
+            for leaf in leaves {
+                exprs.push_back(self.parse_sql_expr(leaf)?);
+            }
+            return Self::balanced_binary_expr(exprs, df_op);
+        }
+
         Ok(Expr::BinaryExpr(BinaryExpr::new(
             Box::new(self.parse_sql_expr(left)?),
-            self.binary_op(op)?,
+            df_op,
             Box::new(self.parse_sql_expr(right)?),
         )))
     }
@@ -378,6 +497,8 @@ impl Planner {
             Cow::Borrowed(value)
         };
         if let Ok(n) = value.parse::<i64>() {
+            Ok(lit(n))
+        } else if let Ok(n) = value.parse::<u64>() {
             Ok(lit(n))
         } else {
             value.parse::<f64>().map(lit).map_err(|_| {
@@ -431,7 +552,7 @@ impl Planner {
             }
             _ => Err(Error::invalid_input(format!(
                 "Unsupported function args: {:?}",
-                &func.args
+                func.args
             ))),
         }
     }
@@ -675,10 +796,10 @@ impl Planner {
                 data_type, value, ..
             }) => {
                 let value = value.clone().into_string().expect_ok()?;
-                Ok(Expr::Cast(datafusion::logical_expr::Cast {
-                    expr: Box::new(Expr::Literal(ScalarValue::Utf8(Some(value)), None)),
-                    data_type: self.parse_type(data_type)?,
-                }))
+                Ok(Expr::Cast(datafusion::logical_expr::Cast::new(
+                    Box::new(Expr::Literal(ScalarValue::Utf8(Some(value)), None)),
+                    self.parse_type(data_type)?,
+                )))
             }
             SQLExpr::IsFalse(expr) => Ok(Expr::IsFalse(Box::new(self.parse_sql_expr(expr)?))),
             SQLExpr::IsNotFalse(expr) => Ok(Expr::IsNotFalse(Box::new(self.parse_sql_expr(expr)?))),
@@ -710,16 +831,7 @@ impl Planner {
                 *negated,
                 Box::new(self.parse_sql_expr(expr)?),
                 Box::new(self.parse_sql_expr(pattern)?),
-                match escape_char {
-                    Some(Value::SingleQuotedString(char)) => char.chars().next(),
-                    Some(value) => {
-                        return Err(Error::invalid_input(format!(
-                            "Invalid escape character in LIKE expression. Expected a single character wrapped with single quotes, got {}",
-                            value
-                        )));
-                    }
-                    None => None,
-                },
+                parse_like_escape_char(escape_char)?,
                 true,
             ))),
             SQLExpr::Like {
@@ -732,16 +844,7 @@ impl Planner {
                 *negated,
                 Box::new(self.parse_sql_expr(expr)?),
                 Box::new(self.parse_sql_expr(pattern)?),
-                match escape_char {
-                    Some(Value::SingleQuotedString(char)) => char.chars().next(),
-                    Some(value) => {
-                        return Err(Error::invalid_input(format!(
-                            "Invalid escape character in LIKE expression. Expected a single character wrapped with single quotes, got {}",
-                            value
-                        )));
-                    }
-                    None => None,
-                },
+                parse_like_escape_char(escape_char)?,
                 false,
             ))),
             // JSONB cast: CAST('...' AS JSONB) or '...'::jsonb
@@ -766,15 +869,15 @@ impl Planner {
             } => match kind {
                 datafusion::sql::sqlparser::ast::CastKind::TryCast
                 | datafusion::sql::sqlparser::ast::CastKind::SafeCast => {
-                    Ok(Expr::TryCast(datafusion::logical_expr::TryCast {
-                        expr: Box::new(self.parse_sql_expr(expr)?),
-                        data_type: self.parse_type(data_type)?,
-                    }))
+                    Ok(Expr::TryCast(datafusion::logical_expr::TryCast::new(
+                        Box::new(self.parse_sql_expr(expr)?),
+                        self.parse_type(data_type)?,
+                    )))
                 }
-                _ => Ok(Expr::Cast(datafusion::logical_expr::Cast {
-                    expr: Box::new(self.parse_sql_expr(expr)?),
-                    data_type: self.parse_type(data_type)?,
-                })),
+                _ => Ok(Expr::Cast(datafusion::logical_expr::Cast::new(
+                    Box::new(self.parse_sql_expr(expr)?),
+                    self.parse_type(data_type)?,
+                ))),
             },
             SQLExpr::JsonAccess { .. } => Err(Error::invalid_input("JSON access is not supported")),
             SQLExpr::CompoundFieldAccess { root, access_chain } => {
@@ -859,14 +962,34 @@ impl Planner {
 
     /// Create Logical [Expr] from a SQL expression.
     ///
+    /// Plain column names (e.g. `id`) and backtick-quoted column names (e.g.
+    /// `` `order` ``), as produced by
+    /// [`lance_core::datatypes::escape_field_path_for_project`], are resolved
+    /// directly against the schema without going through the SQL parser,
+    /// producing the same expression the SQL parser would. Anything else,
+    /// including nested field paths, falls through to the full SQL parser.
+    ///
     /// Note: the returned expression must be passed through `optimize_filter()`
     /// before being passed to `create_physical_expr()`.
     pub fn parse_expr(&self, expr: &str) -> Result<Expr> {
         // First check if it's a simple column reference (no operators, functions, etc.)
-        // resolve_column_name tries exact match first, then falls back to case-insensitive
+        // resolve_column_name tries exact match first, then falls back to case-insensitive.
+        // This also covers literal column names containing dots, which must win over a
+        // nested path interpretation.
         let resolved_name = self.resolve_column_name(expr);
         if self.schema.field_with_name(&resolved_name).is_ok() {
             return Ok(Expr::Column(Column::from_name(resolved_name)));
+        }
+
+        // A single backtick-quoted name is looked up exactly, as the SQL parser
+        // would. Multi-segment paths are left to the SQL parser: unquoted
+        // segments may carry SQL syntax (e.g. `parent.child + 1`) that
+        // `parse_field_path` does not reject.
+        if let Ok(path) = parse_field_path(expr)
+            && let [name] = path.as_slice()
+            && self.schema.field_with_name(name).is_ok()
+        {
+            return Ok(Expr::Column(Column::from_name(name)));
         }
 
         // Parse as SQL expression
@@ -917,16 +1040,72 @@ impl Planner {
     pub fn optimize_expr(&self, expr: Expr) -> Result<Expr> {
         let df_schema = Arc::new(DFSchema::try_from(self.schema.as_ref().clone())?);
 
-        // DataFusion needs the simplify and coerce passes to be applied before
+        // DataFusion rewrites arrow_cast to Expr::Cast, whose Arrow kernel does not support
+        // integer-to-Time32 casts. Convert literal values with Lance's scalar coercion first.
+        let expr = expr
+            .transform_up(|expr| {
+                let coerced = match &expr {
+                    Expr::ScalarFunction(ScalarFunction { func, args })
+                        if func.name() == "arrow_cast" =>
+                    {
+                        match args.as_slice() {
+                            [
+                                Expr::Literal(value, metadata),
+                                Expr::Literal(ScalarValue::Utf8(Some(data_type)), _),
+                            ] => data_type
+                                .parse::<ArrowDataType>()
+                                .ok()
+                                .filter(|data_type| matches!(data_type, ArrowDataType::Time32(_)))
+                                .and_then(|data_type| {
+                                    if matches!(value, ScalarValue::Null) {
+                                        ScalarValue::try_new_null(&data_type).ok()
+                                    } else {
+                                        safe_coerce_scalar(value, &data_type)
+                                    }
+                                })
+                                .map(|value| Expr::Literal(value, metadata.clone())),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+
+                Ok(match coerced {
+                    Some(coerced) => Transformed::yes(coerced),
+                    None => Transformed::no(expr),
+                })
+            })?
+            .data;
+
+        // DataFusion needs the coerce and simplify passes to be applied before
         // expressions can be handled by the physical planner.
-        let simplify_context = SimplifyContext::default()
+        let simplify_context = SimplifyContext::builder()
             .with_schema(df_schema.clone())
-            .with_query_execution_start_time(Some(Utc::now()));
+            .with_query_execution_start_time(Some(Utc::now()))
+            .build();
         let simplifier =
             datafusion::optimizer::simplify_expressions::ExprSimplifier::new(simplify_context);
 
-        let expr = simplifier.simplify(expr)?;
+        // Coerce before simplify to match DataFusion's analyzer-before-optimizer pipeline.
         let expr = simplifier.coerce(expr, &df_schema)?;
+
+        // Fold each comparison's own operands and rewrite it before anything above
+        // it folds. `simplify` folds an operand and everything above it in one
+        // pass, so a fully constant predicate whose zero appears only as a result
+        // of folding never presents a zero literal to the rewrite:
+        // `-1.0 * 0.0 < (1.0 - 1.0)` answered `true` where IEEE says false, and a
+        // wrapper such as `IS TRUE` or a `CAST` did the same to the comparison's
+        // own result.
+        let expr = normalize_zero_comparisons(expr, &|operand| simplifier.simplify(operand))?;
+
+        // Again after simplify, which is what expands `BETWEEN` into two
+        // comparisons and folds the casts `coerce` inserts, so those forms only
+        // become visible on this pass.
+        //
+        // Running the rewrite more than once is safe because its output is a fixed
+        // point of `optimize_expr`; `optimizing_twice_changes_nothing` pins that.
+        let expr = simplifier.simplify(expr)?;
+        let expr = rewrite_signed_zero_comparisons(expr)?;
 
         Ok(expr)
     }
@@ -939,6 +1118,16 @@ impl Planner {
             df_schema.as_ref(),
             &Default::default(),
         )?)
+    }
+
+    /// Create a [`PhysicalExpr`] using the caller's DataFusion session.
+    pub fn create_physical_expr_with_session(
+        &self,
+        expr: &Expr,
+        session: &dyn Session,
+    ) -> Result<Arc<dyn PhysicalExpr>> {
+        let df_schema = DFSchema::try_from(self.schema.as_ref().clone())?;
+        Ok(session.create_physical_expr(expr.clone(), &df_schema)?)
     }
 
     /// Collect the columns in the expression.
@@ -989,13 +1178,9 @@ impl TreeNodeVisitor<'_> for ColumnCapturingVisitor {
                 self.columns.insert(path);
                 self.current_path.clear();
             }
-            Expr::ScalarFunction(udf) => {
-                if udf.name() == GetFieldFunc::default().name() {
-                    if let Some(name) = get_as_string_scalar_opt(&udf.args[1]) {
-                        self.current_path.push_front(name.to_string())
-                    } else {
-                        self.current_path.clear();
-                    }
+            Expr::ScalarFunction(udf) if udf.name() == GetFieldFunc::default().name() => {
+                if let Some(name) = get_as_string_scalar_opt(&udf.args[1]) {
+                    self.current_path.push_front(name.to_string())
                 } else {
                     self.current_path.clear();
                 }
@@ -1012,15 +1197,13 @@ impl TreeNodeVisitor<'_> for ColumnCapturingVisitor {
 #[cfg(test)]
 mod tests {
 
-    use crate::logical_expr::ExprExt;
-
     use super::*;
 
     use arrow::datatypes::Float64Type;
     use arrow_array::{
         ArrayRef, BooleanArray, Float32Array, Int32Array, Int64Array, RecordBatch, StringArray,
-        StructArray, TimestampMicrosecondArray, TimestampMillisecondArray,
-        TimestampNanosecondArray, TimestampSecondArray,
+        StructArray, Time32SecondArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+        TimestampNanosecondArray, TimestampSecondArray, UInt64Array,
     };
     use arrow_schema::{DataType, Fields, Schema};
     use datafusion::{
@@ -1028,6 +1211,7 @@ mod tests {
         prelude::{array_element, get_field},
     };
     use datafusion_functions::core::expr_ext::FieldAccessor;
+    use rstest::rstest;
 
     #[test]
     fn test_parse_filter_simple() {
@@ -1048,7 +1232,7 @@ mod tests {
 
         let expected = col("i")
             .gt(lit(3_i32))
-            .and(col("st").field_newstyle("x").lt_eq(lit(5.0_f32)))
+            .and(col("st").field("x").lt_eq(lit(5.0_f32)))
             .and(
                 col("s")
                     .eq(lit("str-4"))
@@ -1098,6 +1282,296 @@ mod tests {
                 false, false, false, false, true, true, false, false, false, false
             ])
         );
+    }
+
+    #[rstest]
+    #[case::not_equal_to_integer_expression(
+        "flag != (id > 0)",
+        [false, false, true]
+    )]
+    #[case::equal_to_float_expression("flag = (x > 1.0)", [false, false, false])]
+    #[case::expression_on_left("(id > 0) != flag", [false, false, true])]
+    #[case::literal_expression("flag != (1 > 0)", [false, true, false])]
+    #[case::boolean_literal("flag != TRUE", [false, true, false])]
+    fn test_parse_boolean_column_compared_to_expression(
+        #[case] filter: &str,
+        #[case] expected: [bool; 3],
+    ) {
+        let batch = arrow_array::record_batch!(
+            ("flag", Boolean, [true, false, true]),
+            ("id", Int32, [1, 0, -1]),
+            ("x", Float32, [0.5, 2.0, 1.0])
+        )
+        .unwrap();
+        let planner = Planner::new(batch.schema());
+
+        let expr = planner.parse_filter(filter).unwrap();
+        let expr = planner.optimize_expr(expr).unwrap();
+        let physical_expr = planner.create_physical_expr(&expr).unwrap();
+        let predicates = physical_expr.evaluate(&batch).unwrap();
+
+        assert_eq!(
+            predicates.into_array(0).unwrap().as_ref(),
+            &BooleanArray::from(expected.to_vec())
+        );
+    }
+
+    #[rstest]
+    #[case::shift("u = (1 << 63)", [true, false, false])]
+    #[case::string_concat("s = ('a' || 'b')", [true, false, false])]
+    fn test_parse_comparison_to_same_type_literal_expression(
+        #[case] filter: &str,
+        #[case] expected: [bool; 3],
+    ) {
+        let batch = arrow_array::record_batch!(
+            ("u", UInt64, [1_u64 << 63, 3, 0]),
+            ("s", LargeUtf8, ["ab", "a", "b"])
+        )
+        .unwrap();
+        let planner = Planner::new(batch.schema());
+
+        let expr = planner.parse_filter(filter).unwrap();
+        let physical_expr = planner.create_physical_expr(&expr).unwrap();
+        let predicates = physical_expr.evaluate(&batch).unwrap();
+
+        assert_eq!(
+            predicates.into_array(0).unwrap().as_ref(),
+            &BooleanArray::from(expected.to_vec())
+        );
+    }
+
+    #[rstest]
+    #[case::float_literal("f = n + 0.5")]
+    #[case::float_literal_on_left("f = 0.5 + n")]
+    #[case::float_expression_on_left("n + 0.5 = f")]
+    #[case::wide_integer_literal("wide = small + 128")]
+    #[case::wide_integer_literal_on_left("wide = 128 + small")]
+    #[case::integer_expression_on_left("small + 128 = wide")]
+    fn test_parse_comparison_to_mixed_type_expression(#[case] filter: &str) {
+        let batch = arrow_array::record_batch!(
+            ("f", Float64, [Some(1.5), Some(1.5), None, Some(1.5)]),
+            ("n", Int64, [Some(1), Some(2), Some(1), None]),
+            ("wide", Int64, [Some(129), Some(129), Some(129), None]),
+            ("small", Int8, [Some(1), Some(2), None, Some(1)])
+        )
+        .unwrap();
+        let planner = Planner::new(batch.schema());
+
+        let expr = planner.parse_filter(filter).unwrap();
+        let expr = planner.optimize_expr(expr).unwrap();
+        let physical_expr = planner.create_physical_expr(&expr).unwrap();
+        let predicates = physical_expr.evaluate(&batch).unwrap();
+
+        assert_eq!(
+            predicates.into_array(batch.num_rows()).unwrap().as_ref(),
+            &BooleanArray::from(vec![Some(true), Some(false), None, None])
+        );
+    }
+
+    #[test]
+    fn test_parse_filter_uint64_literal_above_i64_max() {
+        let value = u64::MAX - 1;
+        let batch = arrow_array::record_batch!(("id", UInt64, [1, value])).unwrap();
+        let planner = Planner::new(batch.schema());
+
+        let expr = planner.parse_filter(&format!("id = {value}")).unwrap();
+        assert_eq!(expr, col("id").eq(lit(value)));
+
+        let physical_expr = planner.create_physical_expr(&expr).unwrap();
+        let predicates = physical_expr.evaluate(&batch).unwrap();
+        assert_eq!(
+            predicates.into_array(0).unwrap().as_ref(),
+            &BooleanArray::from(vec![false, true])
+        );
+
+        let expr = planner
+            .parse_expr("arrow_cast(NULL, 'Time32(Second)')")
+            .unwrap();
+        let expr = planner.optimize_expr(expr).unwrap();
+        assert_eq!(expr, Expr::Literal(ScalarValue::Time32Second(None), None));
+    }
+
+    fn column_resolution_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("order", DataType::Utf8, true),
+            Field::new("a`b", DataType::Int32, false),
+            Field::new(
+                "parent",
+                DataType::Struct(Fields::from(vec![Field::new(
+                    "child",
+                    DataType::Int32,
+                    false,
+                )])),
+                false,
+            ),
+        ]))
+    }
+
+    /// Parse `input` through the SQL parser only, bypassing the field path
+    /// fast path in `parse_expr`.
+    fn parse_expr_via_sql(planner: &Planner, input: &str) -> Expr {
+        let ast_expr = parse_sql_expr(input).unwrap();
+        let expr = planner.parse_sql_expr(&ast_expr).unwrap();
+        let schema = lance_core::datatypes::Schema::try_from(planner.schema.as_ref()).unwrap();
+        resolve_expr(&expr, &schema).unwrap()
+    }
+
+    #[rstest]
+    #[case::bare("id", col("id"))]
+    #[case::backtick_quoted("`id`", col("id"))]
+    #[case::case_insensitive("ID", col("id"))]
+    #[case::reserved_word("`order`", col("order"))]
+    #[case::escaped_backtick("`a``b`", col("a`b"))]
+    fn test_parse_expr_column_resolution(#[case] input: &str, #[case] expected: Expr) {
+        let planner = Planner::new(column_resolution_schema());
+
+        let expr = planner.parse_expr(input).unwrap();
+        assert_eq!(expr, expected);
+        // The fast path must produce the same expression as the SQL parser.
+        assert_eq!(expr, parse_expr_via_sql(&planner, input));
+    }
+
+    /// Inputs the fast path does not resolve must behave exactly like the SQL path.
+    #[rstest]
+    #[case::unknown_column("`missing`")]
+    #[case::quoted_wrong_case("`ID`")]
+    #[case::unknown_nested_root("`missing`.`child`")]
+    #[case::not_a_path("id + 1")]
+    #[case::nested("`parent`.`child`")]
+    #[case::nested_unquoted("parent.child")]
+    #[case::nested_case_insensitive("`PARENT`.`child`")]
+    #[case::nested_arithmetic("parent.child + 1")]
+    #[case::nested_comparison("parent.child > 1")]
+    #[case::nested_null_test("parent.child IS NULL")]
+    #[case::nested_cast("parent.child::BIGINT")]
+    #[case::quoted_nested_arithmetic("`parent`.`child` + 1")]
+    fn test_parse_expr_column_resolution_falls_back_to_sql(#[case] input: &str) {
+        let planner = Planner::new(column_resolution_schema());
+
+        let fast = planner.parse_expr(input);
+        let sql = parse_sql_expr(input)
+            .and_then(|ast| planner.parse_sql_expr(&ast))
+            .and_then(|expr| {
+                let schema = lance_core::datatypes::Schema::try_from(planner.schema.as_ref())?;
+                resolve_expr(&expr, &schema)
+            });
+        assert_eq!(fast.is_ok(), sql.is_ok(), "{input}: {fast:?} vs {sql:?}");
+        if let (Ok(fast), Ok(sql)) = (fast, sql) {
+            assert_eq!(fast, sql);
+        }
+    }
+
+    /// A literal column whose name contains a dot must win over the nested
+    /// field interpretation of the same string (see #4825).
+    #[test]
+    fn test_parse_expr_literal_dotted_column_beats_nested_path() {
+        let child = Arc::new(Field::new("child", DataType::Int32, false));
+        let parent = StructArray::new(
+            vec![child].into(),
+            vec![Arc::new(Int32Array::from(vec![7, 10]))],
+            None,
+        );
+        let batch = RecordBatch::try_from_iter([
+            ("parent", Arc::new(parent) as ArrayRef),
+            (
+                "parent.child",
+                Arc::new(Int32Array::from(vec![100, 200])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let planner = Planner::new(batch.schema());
+
+        let expr = planner.parse_expr("parent.child").unwrap();
+        assert_eq!(expr, Expr::Column(Column::from_name("parent.child")));
+        let expr = planner.optimize_expr(expr).unwrap();
+        let physical = planner.create_physical_expr(&expr).unwrap();
+        let actual = physical.evaluate(&batch).unwrap().into_array(2).unwrap();
+        let expected: ArrayRef = Arc::new(Int32Array::from(vec![100, 200]));
+        assert_eq!(actual.as_ref(), expected.as_ref());
+    }
+
+    #[test]
+    fn test_parse_expr_with_relations_uses_sql_path() {
+        let planner = Planner::new(column_resolution_schema()).with_enable_relations(true);
+
+        // With relations enabled, the first segment is a relation name.
+        let expr = planner.parse_expr("`t`.`id`").unwrap();
+        assert_eq!(expr, Expr::Column(Column::new(Some("t"), "id")));
+    }
+
+    #[test]
+    fn test_parse_expr_sql_fallback() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let planner = Planner::new(schema);
+
+        let expr = planner.parse_expr("id + 1").unwrap();
+        assert_eq!(expr, col("id") + lit(1_i32));
+    }
+
+    #[test]
+    fn test_parse_deep_logical_filter() {
+        let planner = Planner::new(Arc::new(Schema::empty()));
+
+        for op in ["AND", "OR"] {
+            let filter = std::iter::repeat_n("true", 1000)
+                .collect::<Vec<_>>()
+                .join(&format!(" {op} "));
+
+            let expr = planner.parse_filter(&filter).unwrap();
+            let optimized = planner.optimize_expr(expr).unwrap();
+
+            assert_eq!(optimized, lit(true));
+        }
+    }
+
+    #[derive(Debug, Eq, PartialEq, Hash)]
+    struct StrictFloat64Udf {
+        signature: Signature,
+    }
+
+    impl StrictFloat64Udf {
+        fn new() -> Self {
+            Self {
+                signature: Signature::exact(vec![DataType::Float64], Volatility::Immutable),
+            }
+        }
+    }
+
+    impl ScalarUDFImpl for StrictFloat64Udf {
+        fn name(&self) -> &str {
+            "strict_float64"
+        }
+
+        fn signature(&self) -> &Signature {
+            &self.signature
+        }
+
+        fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+            Ok(DataType::Float64)
+        }
+
+        fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+            let data_type = args.args[0].data_type();
+            assert_eq!(
+                data_type,
+                DataType::Float64,
+                "strict_float64 expected Float64, got {data_type}"
+            );
+            Ok(ColumnarValue::Scalar(ScalarValue::Float64(Some(0.0))))
+        }
+    }
+
+    #[test]
+    fn test_coerce_before_simplify() {
+        let planner = Planner::new(Arc::new(Schema::empty()));
+        let strict_float64 = Arc::new(ScalarUDF::new_from_impl(StrictFloat64Udf::new()));
+        let expr = Expr::ScalarFunction(ScalarFunction::new_udf(strict_float64, vec![lit(0_i64)]))
+            .eq(lit(0.0_f64));
+
+        let optimized = planner.optimize_expr(expr).unwrap();
+
+        planner.create_physical_expr(&optimized).unwrap();
     }
 
     #[test]
@@ -1232,6 +1706,40 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::right("value >> 32", Operator::BitwiseShiftRight, vec![0, 1, 3])]
+    #[case::left(
+        "value << 1",
+        Operator::BitwiseShiftLeft,
+        vec![0, 2_u64 << 32, ((3_u64 << 32) + 7) << 1]
+    )]
+    fn test_bitwise_shift_expressions(
+        #[case] sql: &str,
+        #[case] expected_op: Operator,
+        #[case] expected: Vec<u64>,
+    ) {
+        let input = vec![0, 1_u64 << 32, (3_u64 << 32) + 7];
+        let batch =
+            RecordBatch::try_from_iter([("value", Arc::new(UInt64Array::from(input)) as ArrayRef)])
+                .unwrap();
+        let planner = Planner::new(batch.schema());
+
+        let expr = planner.parse_expr(sql).unwrap();
+        let Expr::BinaryExpr(binary_expr) = &expr else {
+            panic!("expected binary expression for {sql}, got {expr}");
+        };
+        assert_eq!(binary_expr.op, expected_op);
+
+        let expr = planner.optimize_expr(expr).unwrap();
+        let physical_expr = planner.create_physical_expr(&expr).unwrap();
+        let values = physical_expr
+            .evaluate(&batch)
+            .unwrap()
+            .into_array(batch.num_rows())
+            .unwrap();
+        assert_eq!(values.as_ref(), &UInt64Array::from(expected));
+    }
+
     #[test]
     fn test_negative_array_expressions() {
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
@@ -1308,6 +1816,36 @@ mod tests {
                 true, true, true, true, false, true, true, true, true, true
             ])
         );
+    }
+
+    #[test]
+    fn test_like_escape_char() {
+        let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, true)]));
+        let planner = Planner::new(schema);
+
+        // A valid single-character escape is captured for both LIKE and ILIKE.
+        for filter in ["s LIKE 'a!%' ESCAPE '!'", "s ILIKE 'a!%' ESCAPE '!'"] {
+            match planner.parse_filter(filter).unwrap() {
+                Expr::Like(like) => assert_eq!(like.escape_char, Some('!'), "{filter}"),
+                other => panic!("expected a LIKE expression for `{filter}`, got {other:?}"),
+            }
+        }
+
+        // Empty and multi-character escapes are rejected rather than silently
+        // dropped or truncated to the first character.
+        for filter in [
+            "s LIKE 'x' ESCAPE ''",
+            "s LIKE 'x' ESCAPE 'ab'",
+            "s ILIKE 'x' ESCAPE ''",
+            "s ILIKE 'x' ESCAPE 'ab'",
+        ] {
+            let err = planner.parse_filter(filter).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("Invalid escape character in LIKE expression"),
+                "unexpected error for `{filter}`: {err}"
+            );
+        }
     }
 
     #[test]
@@ -1466,7 +2004,7 @@ mod tests {
 
             match expr {
                 Expr::BinaryExpr(BinaryExpr { right, .. }) => match right.as_ref() {
-                    Expr::Cast(Cast { expr, data_type }) => {
+                    Expr::Cast(Cast { expr, field }) => {
                         match expr.as_ref() {
                             Expr::Literal(ScalarValue::Utf8(Some(value_str)), _) => {
                                 assert_eq!(value_str, expected_value_str);
@@ -1476,13 +2014,35 @@ mod tests {
                             }
                             _ => panic!("Expected cast to be applied to literal"),
                         }
-                        assert_eq!(data_type, expected_data_type);
+                        assert_eq!(field.data_type(), expected_data_type);
                     }
                     _ => panic!("Expected right to be a cast"),
                 },
                 _ => panic!("Expected binary expression"),
             }
         }
+    }
+
+    #[test]
+    fn test_arrow_cast_int_literal_to_time32() {
+        let batch = RecordBatch::try_from_iter([(
+            "v",
+            Arc::new(Time32SecondArray::from(vec![3725, 3726])) as ArrayRef,
+        )])
+        .unwrap();
+        let planner = Planner::new(batch.schema());
+
+        let expr = planner
+            .parse_filter("v = arrow_cast(3726, 'Time32(Second)')")
+            .unwrap();
+        let expr = planner.optimize_expr(expr).unwrap();
+        let physical_expr = planner.create_physical_expr(&expr).unwrap();
+        let predicates = physical_expr.evaluate(&batch).unwrap();
+
+        assert_eq!(
+            predicates.into_array(0).unwrap().as_ref(),
+            &BooleanArray::from(vec![false, true])
+        );
     }
 
     #[test]
@@ -1517,14 +2077,14 @@ mod tests {
 
             match expr {
                 Expr::BinaryExpr(BinaryExpr { right, .. }) => match right.as_ref() {
-                    Expr::Cast(Cast { expr, data_type }) => {
+                    Expr::Cast(Cast { expr, field }) => {
                         match expr.as_ref() {
                             Expr::Literal(ScalarValue::Utf8(Some(value_str)), _) => {
                                 assert_eq!(value_str, expected_value_str);
                             }
                             _ => panic!("Expected cast to be applied to literal"),
                         }
-                        assert_eq!(data_type, expected_data_type);
+                        assert_eq!(field.data_type(), expected_data_type);
                     }
                     _ => panic!("Expected right to be a cast"),
                 },
@@ -1752,6 +2312,33 @@ mod tests {
     }
 
     #[test]
+    fn test_lance_context_provider_resolves_session_functions() {
+        let session = crate::exec::new_session_context(&LanceExecutionOptions::default());
+        let ctx_provider = LanceContextProvider::new(session.clone());
+        assert!(ctx_provider.get_function_meta("contains_tokens").is_some());
+        assert!(ctx_provider.get_function_meta("lower").is_some());
+        assert!(ctx_provider.get_aggregate_meta("sum").is_some());
+        assert!(ctx_provider.get_window_meta("row_number").is_some());
+        assert!(ctx_provider.get_function_meta("registered_later").is_none());
+
+        // The provider reads the session's functions instead of a copy, so a
+        // function registered on the session afterwards resolves as well.
+        session.register_udf(datafusion::logical_expr::create_udf(
+            "registered_later",
+            vec![DataType::Utf8],
+            DataType::Utf8,
+            Volatility::Immutable,
+            Arc::new(|args: &[ColumnarValue]| Ok(args[0].clone())),
+        ));
+        assert!(ctx_provider.get_function_meta("registered_later").is_some());
+        assert!(
+            ctx_provider
+                .udf_names()
+                .contains(&"registered_later".to_string())
+        );
+    }
+
+    #[test]
     fn test_regexp_match_and_non_empty_captions() {
         // Repro for a bug where regexp_match inside an AND chain wasn't coerced to boolean,
         // causing planning/evaluation failures. This should evaluate successfully.
@@ -1811,28 +2398,77 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_regexp_match_infer_error_without_boolean_coercion() {
-        // With the fix applied, using parse_filter should coerce regexp_match to boolean
-        // even when nested in a larger AND expression, so this should plan successfully.
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("keywords", DataType::Utf8, true),
-            Field::new("natural_caption", DataType::Utf8, true),
-            Field::new("poetic_caption", DataType::Utf8, true),
-        ]));
+    #[rstest]
+    #[case::bare("regexp_match(name, 'e[12]')", [false, true, true, false, false, false])]
+    #[case::is_not_null(
+        "regexp_match(name, 'e[12]') IS NOT NULL",
+        [false, true, true, false, false, false]
+    )]
+    #[case::is_null(
+        "regexp_match(name, 'e[12]') IS NULL",
+        [true, false, false, true, true, true]
+    )]
+    #[case::not_bare(
+        "NOT regexp_match(name, 'e[12]')",
+        [true, false, false, true, true, true]
+    )]
+    #[case::and_bare(
+        "regexp_match(name, 'e[12]') AND name <> 'name2'",
+        [false, true, false, false, false, false]
+    )]
+    #[case::or_bare(
+        "regexp_match(name, 'e[12]') OR name IS NULL",
+        [false, true, true, true, false, false]
+    )]
+    #[case::not_is_not_null(
+        "NOT (regexp_match(name, 'e[12]') IS NOT NULL)",
+        [true, false, false, true, true, true]
+    )]
+    #[case::and_is_null(
+        "regexp_match(name, 'e[12]') IS NULL AND name IS NOT NULL",
+        [true, false, false, false, true, true]
+    )]
+    #[case::or_is_not_null(
+        "regexp_match(name, 'e[12]') IS NOT NULL OR name IS NULL",
+        [false, true, true, true, false, false]
+    )]
+    fn test_regexp_match_filter_coercion(#[case] filter: &str, #[case] expected: [bool; 6]) {
+        let batch = arrow_array::record_batch!((
+            "name",
+            Utf8,
+            [
+                Some("name0"),
+                Some("name1"),
+                Some("name2"),
+                None,
+                Some("name4"),
+                Some("name5")
+            ]
+        ))
+        .unwrap();
+        let planner = Planner::new(batch.schema());
+        let expr = planner.parse_filter(filter).unwrap();
+        let physical_expr = planner.create_physical_expr(&expr).unwrap();
+        let result = physical_expr.evaluate(&batch).unwrap();
 
+        assert_eq!(
+            result.into_array(batch.num_rows()).unwrap().as_ref(),
+            &BooleanArray::from(expected.to_vec())
+        );
+    }
+
+    #[rstest]
+    #[case::is_not_null("regexp_match(name, 'e[12]') IS NOT NULL")]
+    #[case::is_null("regexp_match(name, 'e[12]') IS NULL")]
+    #[case::comparison("regexp_match(name, 'e[12]') = regexp_match(name, 'e[12]')")]
+    fn test_regexp_match_preserves_value_contexts(#[case] filter: &str) {
+        let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, true)]));
         let planner = Planner::new(schema);
 
-        let expr = planner
-            .parse_filter(
-                "regexp_match(keywords, 'Liberty|revolution') AND \
-                 (natural_caption IS NOT NULL AND natural_caption <> '' AND \
-                  poetic_caption IS NOT NULL AND poetic_caption <> '')",
-            )
-            .unwrap();
-
-        // Should not panic
-        let _physical = planner.create_physical_expr(&expr).unwrap();
+        assert_eq!(
+            planner.parse_filter(filter).unwrap(),
+            planner.parse_expr(filter).unwrap()
+        );
     }
 
     #[test]

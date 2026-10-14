@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashSet;
 use std::fmt::Write;
 use std::sync::Arc;
 
@@ -11,9 +10,9 @@ use arrow_data::ArrayData;
 use chrono::{DateTime, Utc};
 use lance::dataset::Dataset as LanceDataset;
 use lance::index::DatasetIndexExt;
+use lance::index::IndexSegment;
 use lance::index::vector::ivf::builder::write_vector_storage;
 use lance::index::vector::pq::build_pq_model_in_fragments;
-use lance::index::{IndexSegment, IndexSegmentPlan};
 use lance::io::ObjectStore;
 use lance_index::progress::NoopIndexBuildProgress;
 use lance_index::vector::ivf::shuffler::{IvfShuffler, shuffle_vectors};
@@ -36,7 +35,7 @@ use pyo3::{
 use lance::index::DatasetIndexInternalExt;
 
 use crate::fragment::FileFragment;
-use crate::utils::{PyJson, PyLance};
+use crate::utils::PyJson;
 use crate::{
     dataset::Dataset, error::PythonErrorExt, file::object_store_from_uri_or_path_no_options, rt,
 };
@@ -73,12 +72,6 @@ pub struct PyIndexSegment {
     pub(crate) inner: IndexSegment,
 }
 
-impl PyIndexSegment {
-    pub(crate) fn from_inner(inner: IndexSegment) -> Self {
-        Self { inner }
-    }
-}
-
 #[pymethods]
 impl PyIndexSegment {
     #[getter]
@@ -87,8 +80,8 @@ impl PyIndexSegment {
     }
 
     #[getter]
-    fn fragment_ids(&self) -> HashSet<u32> {
-        self.inner.fragment_bitmap().iter().collect()
+    fn fragment_ids(&self) -> crate::bitmap::PyBitmap {
+        crate::bitmap::PyBitmap::new(self.inner.fragment_bitmap().clone())
     }
 
     #[getter]
@@ -98,60 +91,10 @@ impl PyIndexSegment {
 
     fn __repr__(&self) -> String {
         format!(
-            "IndexSegment(uuid={}, fragment_ids={:?}, index_version={})",
+            "IndexSegment(uuid={}, fragment_ids={}, index_version={})",
             self.uuid(),
-            self.fragment_ids(),
+            self.fragment_ids().__repr__(),
             self.index_version()
-        )
-    }
-}
-
-#[pyclass(
-    name = "IndexSegmentPlan",
-    module = "lance.indices",
-    skip_from_py_object
-)]
-#[derive(Debug, Clone)]
-pub struct PyIndexSegmentPlan {
-    pub(crate) inner: IndexSegmentPlan,
-}
-
-impl PyIndexSegmentPlan {
-    pub(crate) fn from_inner(inner: IndexSegmentPlan) -> Self {
-        Self { inner }
-    }
-}
-
-#[pymethods]
-impl PyIndexSegmentPlan {
-    #[getter]
-    fn segment(&self) -> PyIndexSegment {
-        PyIndexSegment::from_inner(self.inner.segment().clone())
-    }
-
-    #[getter]
-    fn segments(&self) -> Vec<PyLance<lance_table::format::IndexMetadata>> {
-        self.inner.segments().iter().cloned().map(PyLance).collect()
-    }
-
-    #[getter]
-    fn estimated_bytes(&self) -> u64 {
-        self.inner.estimated_bytes()
-    }
-
-    #[getter]
-    fn requested_index_type(&self) -> Option<String> {
-        self.inner
-            .requested_index_type()
-            .map(|index_type| index_type.to_string())
-    }
-
-    fn __repr__(&self) -> String {
-        format!(
-            "IndexSegmentPlan(segments={}, estimated_bytes={}, requested_index_type={:?})",
-            self.inner.segments().len(),
-            self.estimated_bytes(),
-            self.requested_index_type()
         )
     }
 }
@@ -201,11 +144,7 @@ async fn do_get_ivf_model(dataset: &Dataset, index_name: &str) -> PyResult<IvfMo
     // Open the vector index
     let vindex = dataset
         .ds
-        .open_vector_index(
-            column_name,
-            &idx_meta.uuid.to_string(),
-            &NoOpMetricsCollector,
-        )
+        .open_vector_index(column_name, &idx_meta.uuid, &NoOpMetricsCollector)
         .await
         .infer_error()?;
 
@@ -292,6 +231,7 @@ async fn do_train_pq_model(
     distance_type: &str,
     sample_rate: u32,
     max_iters: u32,
+    num_bits: u32,
     ivf_model: IvfModel,
     fragment_ids: Option<Vec<u32>>,
 ) -> PyResult<ArrayData> {
@@ -299,7 +239,7 @@ async fn do_train_pq_model(
     let distance_type = DistanceType::try_from(distance_type).unwrap();
     let params = PQBuildParams {
         num_sub_vectors: num_subvectors as usize,
-        num_bits: 8,
+        num_bits: num_bits as usize,
         max_iters: max_iters as usize,
         sample_rate: sample_rate as usize,
         ..Default::default()
@@ -320,7 +260,7 @@ async fn do_train_pq_model(
 
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
-#[pyo3(signature=(dataset, column, dimension, num_subvectors, distance_type, sample_rate, max_iters, ivf_centroids, fragment_ids=None))]
+#[pyo3(signature=(dataset, column, dimension, num_subvectors, distance_type, sample_rate, max_iters, ivf_centroids, fragment_ids=None, num_bits=8))]
 fn train_pq_model<'py>(
     py: Python<'py>,
     dataset: &Dataset,
@@ -332,6 +272,7 @@ fn train_pq_model<'py>(
     max_iters: u32,
     ivf_centroids: PyArrowType<ArrayData>,
     fragment_ids: Option<Vec<u32>>,
+    num_bits: u32,
 ) -> PyResult<Bound<'py, PyAny>> {
     let ivf_centroids = ivf_centroids.0;
     let ivf_centroids = FixedSizeListArray::from(ivf_centroids);
@@ -351,11 +292,67 @@ fn train_pq_model<'py>(
             distance_type,
             sample_rate,
             max_iters,
+            num_bits,
             ivf_model,
             fragment_ids,
         ),
     )??;
     codebook.to_pyarrow(py)
+}
+
+/// Mint one RaBitQ rotation and return it as a JSON string.
+///
+/// Distributed IVF_RQ builds must pin a single rotation across all workers so that
+/// independently built per-fragment segments rotate vectors identically and their
+/// binary codes remain comparable when merged. A driver calls this once and broadcasts
+/// the resulting string to every `create_index_uncommitted(..., rabitq_model=...)` call.
+///
+/// The rotation is always the "fast" rotation since its sign vector is JSON-serializable,
+/// whereas the "matrix" rotation stores a dense matrix in a binary buffer that is dropped by
+/// the JSON wire format. `dtype` is accepted for API symmetry but does not affect the fast
+/// rotation.
+///
+/// # Example (Python)
+///
+/// ```python
+/// from lance.lance import indices
+///
+/// # Mint one model and broadcast `model` to every worker.
+/// model = indices.build_rq_model(dimension=128, num_bits=5)
+/// seg = ds.create_index_uncommitted(
+///     column="vector",
+///     index_type="IVF_RQ",
+///     num_partitions=256,
+///     ivf_centroids=centroids,
+///     rabitq_model=model,
+///     fragment_ids=my_fragments,
+/// )
+/// ```
+#[pyfunction]
+#[pyo3(signature = (dimension, num_bits=5, dtype="float32"))]
+pub fn build_rq_model(dimension: usize, num_bits: u8, dtype: &str) -> PyResult<String> {
+    use arrow::datatypes::{Float16Type, Float32Type, Float64Type};
+    use lance_index::vector::bq::RQRotationType;
+    use lance_index::vector::bq::builder::RabitQuantizer;
+    use lance_index::vector::quantizer::Quantization;
+
+    if !dimension.is_multiple_of(u8::BITS as usize) {
+        return Err(PyValueError::new_err(
+            "dimension must be divisible by 8 for IVF_RQ",
+        ));
+    }
+    let dim = dimension as i32;
+    let rotation = RQRotationType::Fast;
+    let quantizer = match dtype.to_lowercase().as_str() {
+        "float16" => RabitQuantizer::new_with_rotation::<Float16Type>(num_bits, dim, rotation),
+        "float32" => RabitQuantizer::new_with_rotation::<Float32Type>(num_bits, dim, rotation),
+        "float64" => RabitQuantizer::new_with_rotation::<Float64Type>(num_bits, dim, rotation),
+        other => {
+            return Err(PyValueError::new_err(format!("unsupported dtype: {other}")));
+        }
+    };
+    serde_json::to_string(&quantizer.metadata(None))
+        .map_err(|e| PyValueError::new_err(format!("failed to serialize RQ model: {e}")))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -403,7 +400,7 @@ async fn do_transform_vectors(
 
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
-#[pyo3(signature=(dataset, column, dimension, num_subvectors, distance_type, ivf_centroids, pq_codebook, dst_uri, fragments, partitions_ds_uri=None))]
+#[pyo3(signature=(dataset, column, dimension, num_subvectors, distance_type, ivf_centroids, pq_codebook, dst_uri, fragments, partitions_ds_uri=None, num_bits=8))]
 pub fn transform_vectors(
     py: Python<'_>,
     dataset: &Dataset,
@@ -416,15 +413,23 @@ pub fn transform_vectors(
     dst_uri: &str,
     fragments: Vec<FileFragment>,
     partitions_ds_uri: Option<&str>,
+    num_bits: u32,
 ) -> PyResult<()> {
     let ivf_centroids = ivf_centroids.0;
     let ivf_centroids = FixedSizeListArray::from(ivf_centroids);
     let codebook = pq_codebook.0;
     let codebook = FixedSizeListArray::from(codebook);
+    lance_index::vector::pq::validate_supplied_codebook(
+        codebook.values().len(),
+        dimension,
+        num_subvectors as usize,
+        num_bits as usize,
+    )
+    .infer_error()?;
     let distance_type = DistanceType::try_from(distance_type).unwrap();
     let pq = ProductQuantizer::new(
         num_subvectors as usize,
-        /*num_bits=*/ 8,
+        num_bits,
         dimension,
         codebook,
         distance_type,
@@ -534,32 +539,18 @@ async fn do_load_shuffled_vectors(
         uuid: index_id,
         name: index_name.to_string(),
         fields: vec![ds.schema().field(column).unwrap().id],
+        covering_fields: vec![],
         dataset_version: ds.manifest.version,
         fragment_bitmap: Some(ds.fragments().iter().map(|f| f.id as u32).collect()),
         index_details: Some(Arc::new(
-            prost_types::Any::from_msg(&lance_table::format::pb::VectorIndexDetails::default())
-                .unwrap(),
+            prost_types::Any::from_msg(&lance_index::pb::VectorIndexDetails::default()).unwrap(),
         )),
         index_version: IndexType::IvfPq.version(),
         created_at: Some(Utc::now()),
         base_id: None,
         files: Some(files),
     };
-    let segment = IndexSegment::new(
-        metadata.uuid,
-        metadata
-            .fragment_bitmap
-            .as_ref()
-            .expect("vector metadata should include fragment coverage")
-            .iter(),
-        metadata
-            .index_details
-            .as_ref()
-            .expect("vector metadata should include index details")
-            .clone(),
-        metadata.index_version,
-    );
-    ds.commit_existing_index_segments(index_name, column, vec![segment])
+    ds.commit_existing_index_segments(index_name, column, vec![metadata])
         .await
         .infer_error()?;
 
@@ -567,7 +558,7 @@ async fn do_load_shuffled_vectors(
 }
 
 #[pyfunction]
-#[pyo3(signature=(filenames, dir_path, dataset, column, ivf_centroids, pq_codebook, pq_dimension, num_subvectors, distance_type, index_name=None))]
+#[pyo3(signature=(filenames, dir_path, dataset, column, ivf_centroids, pq_codebook, pq_dimension, num_subvectors, distance_type, index_name=None, num_bits=8))]
 #[allow(clippy::too_many_arguments)]
 pub fn load_shuffled_vectors(
     filenames: Vec<String>,
@@ -580,6 +571,7 @@ pub fn load_shuffled_vectors(
     num_subvectors: u32,
     distance_type: &str,
     index_name: Option<&str>,
+    num_bits: u32,
 ) -> PyResult<()> {
     let mut default_idx_name = column.to_string();
     default_idx_name.push_str("_idx");
@@ -597,11 +589,18 @@ pub fn load_shuffled_vectors(
 
     let codebook = pq_codebook.0;
     let codebook = FixedSizeListArray::from(codebook);
+    lance_index::vector::pq::validate_supplied_codebook(
+        codebook.values().len(),
+        pq_dimension,
+        num_subvectors as usize,
+        num_bits as usize,
+    )
+    .infer_error()?;
 
     let distance_type = DistanceType::try_from(distance_type).unwrap();
     let pq_model = ProductQuantizer::new(
         num_subvectors as usize,
-        /*num_bits=*/ 8,
+        num_bits,
         pq_dimension,
         codebook,
         distance_type,
@@ -628,7 +627,7 @@ pub struct PyIndexSegmentDescription {
     /// The dataset version at which the index segment was last updated
     pub dataset_version_at_last_update: u64,
     /// The fragment ids that are covered by the index segment
-    pub fragment_ids: HashSet<u32>,
+    pub fragment_ids: crate::bitmap::PyBitmap,
     /// The version of the index
     pub index_version: i32,
     /// The timestamp when the index segment was created
@@ -636,15 +635,18 @@ pub struct PyIndexSegmentDescription {
     /// The total size in bytes of all files in this segment
     /// (None for backward compatibility with indices created before file tracking)
     pub size_bytes: Option<u64>,
+    /// The id of the dataset base path that stores this segment
+    /// (None when the segment is stored in the dataset's default base path)
+    pub base_id: Option<i64>,
+    /// The ids of the fields whose values this segment carries but is not keyed on.
+    /// Always the trailing entries of the segment's fields.
+    pub covering_fields: Vec<i32>,
 }
 
 impl PyIndexSegmentDescription {
     pub fn from_metadata(segment: &lance_table::format::IndexMetadata) -> Self {
-        let fragment_ids = segment
-            .fragment_bitmap
-            .as_ref()
-            .map(|bitmap| bitmap.iter().collect::<HashSet<_>>())
-            .unwrap_or_default();
+        let fragment_ids =
+            crate::bitmap::PyBitmap::new(segment.fragment_bitmap.clone().unwrap_or_default());
         let size_bytes = segment.total_size_bytes();
 
         Self {
@@ -654,18 +656,22 @@ impl PyIndexSegmentDescription {
             index_version: segment.index_version,
             created_at: segment.created_at,
             size_bytes,
+            base_id: segment.base_id.map(|id| id as i64),
+            covering_fields: segment.covering_fields.clone(),
         }
     }
 
     pub fn __repr__(&self) -> String {
         format!(
-            "IndexSegmentDescription(uuid={}, dataset_version_at_last_update={}, fragment_ids={:?}, index_version={}, created_at={:?}, size_bytes={:?})",
+            "IndexSegmentDescription(uuid={}, dataset_version_at_last_update={}, fragment_ids={}, index_version={}, created_at={:?}, size_bytes={:?}, base_id={:?}, covering_fields={:?})",
             self.uuid,
             self.dataset_version_at_last_update,
-            self.fragment_ids,
+            self.fragment_ids.__repr__(),
             self.index_version,
             self.created_at,
-            self.size_bytes
+            self.size_bytes,
+            self.base_id,
+            self.covering_fields
         )
     }
 }
@@ -680,7 +686,8 @@ pub struct PyIndexDescription {
     pub index_type: String,
     /// The ids of the fields that the index is built on
     pub fields: Vec<u32>,
-    /// The names of the fields that the index is built on
+    /// The full paths of the fields that the index is built on
+    /// (dotted, with backtick-quoted segments for non-identifier names)
     pub field_names: Vec<String>,
     /// The number of rows indexed by the index
     pub num_rows_indexed: u64,
@@ -701,9 +708,8 @@ impl PyIndexDescription {
             .map(|field| {
                 dataset
                     .schema()
-                    .field_by_id(*field as i32)
-                    .map(|f| f.name.clone())
-                    .unwrap_or("<unknown>".to_string())
+                    .field_path_minimal(*field as i32)
+                    .unwrap_or_else(|_| "<unknown>".to_string())
             })
             .collect();
 
@@ -753,13 +759,13 @@ pub fn register_indices(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     let indices = PyModule::new(py, "indices")?;
     indices.add_wrapped(wrap_pyfunction!(train_ivf_model))?;
     indices.add_wrapped(wrap_pyfunction!(train_pq_model))?;
+    indices.add_wrapped(wrap_pyfunction!(build_rq_model))?;
     indices.add_wrapped(wrap_pyfunction!(transform_vectors))?;
     indices.add_wrapped(wrap_pyfunction!(shuffle_transformed_vectors))?;
     indices.add_wrapped(wrap_pyfunction!(load_shuffled_vectors))?;
     indices.add_class::<PyIvfModel>()?;
     indices.add_class::<PyIndexConfig>()?;
     indices.add_class::<PyIndexSegment>()?;
-    indices.add_class::<PyIndexSegmentPlan>()?;
     indices.add_class::<PyIndexDescription>()?;
     indices.add_class::<PyIndexSegmentDescription>()?;
     indices.add_wrapped(wrap_pyfunction!(get_ivf_model))?;

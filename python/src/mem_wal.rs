@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::ffi_stream::ArrowArrayStreamReader;
@@ -17,13 +18,16 @@ use datafusion::prelude::SessionContext;
 use futures::TryStreamExt;
 use lance::dataset::Dataset as LanceDataset;
 use lance::dataset::mem_wal::scanner::{
-    FlushedGeneration, LsmDataSourceCollector, LsmPointLookupPlanner, LsmVectorSearchPlanner,
+    LsmDataSourceCollector, LsmPointLookupPlanner, LsmVectorSearchPlanner, SsTable,
+    parse_filter_expr as parse_lsm_filter_expr,
 };
-use lance::dataset::mem_wal::write::{MemTableStats, WriteStatsSnapshot};
+use lance::dataset::mem_wal::write::{MemTableStats, ShardMemory, WriteStatsSnapshot};
 use lance::dataset::mem_wal::{
-    LsmScanner, ShardSnapshot as RegionSnapshot, ShardWriter as RegionWriter,
+    LsmScanner, ShardSnapshot, ShardWriter, arrow_schema_with_field_ids, evaluate_sharding_spec,
 };
-use lance_index::mem_wal::MergedGeneration as LanceMergedGeneration;
+use lance_index::mem_wal::{
+    CompactedSsTable as LanceCompactedSsTable, ShardingField, ShardingSpec,
+};
 use lance_linalg::distance::DistanceType;
 use pyo3::exceptions::{PyIOError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -33,28 +37,108 @@ use uuid::Uuid;
 
 use crate::dataset::Dataset as PyDataset;
 use crate::rt;
+use crate::schema::LanceSchema as PyLanceSchema;
 
-/// Represents a single generation of a MemWAL region that has been merged
-/// into the base table. Used with `MergeInsertBuilder.mark_generations_as_merged()`.
-#[pyclass(name = "_MergedGeneration", module = "_lib")]
-pub struct PyMergedGeneration {
-    pub region_id: String,
+/// Evaluate a MemWAL sharding spec against one PyArrow RecordBatch.
+#[pyfunction(name = "_evaluate_sharding_spec", signature = (batch, spec, schema))]
+pub fn py_evaluate_sharding_spec<'py>(
+    py: Python<'py>,
+    batch: PyArrowType<RecordBatch>,
+    spec: &Bound<'_, PyAny>,
+    schema: &PyLanceSchema,
+) -> PyResult<Bound<'py, PyAny>> {
+    let PyArrowType(batch) = batch;
+    let spec = sharding_spec_from_py(spec)?;
+    let result = evaluate_sharding_spec(&batch, &spec, &schema.0)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    result.to_pyarrow(py)
+}
+
+/// Write a primary-key dedup sidecar (`_pk_index/`) for an SSTable
+/// dataset already written at `gen_path`, mirroring what production flush emits.
+///
+/// Test-support only: lets Python tests stage a *faithful* SSTable
+/// (dataset + sidecar). Production always writes the sidecar during flush, so a
+/// dataset-without-sidecar is not a state the system otherwise produces.
+#[pyfunction(name = "_write_pk_sidecar", signature = (gen_path, data, pk_columns))]
+pub fn py_write_pk_sidecar(
+    py: Python<'_>,
+    gen_path: String,
+    data: &Bound<'_, PyAny>,
+    pk_columns: Vec<String>,
+) -> PyResult<()> {
+    let reader = ArrowArrayStreamReader::from_pyarrow_bound(data)
+        .map_err(|e| PyValueError::new_err(format!("Cannot read data as Arrow: {}", e)))?;
+    let batches: Vec<RecordBatch> = reader
+        .collect::<Result<_, _>>()
+        .map_err(|e| PyIOError::new_err(format!("Failed to read batches: {}", e)))?;
+    rt().block_on(Some(py), async move {
+        let pk_refs: Vec<&str> = pk_columns.iter().map(String::as_str).collect();
+        lance::dataset::mem_wal::scanner::write_pk_sidecar(&gen_path, &batches, &pk_refs).await
+    })?
+    .map_err(|e: lance::Error| PyIOError::new_err(e.to_string()))
+}
+
+fn sharding_spec_from_py(spec: &Bound<'_, PyAny>) -> PyResult<ShardingSpec> {
+    let spec_id = get_py_value(spec, "spec_id")?.extract::<u32>()?;
+    let fields_obj = get_py_value(spec, "fields")?;
+    let mut fields = Vec::new();
+    for field_obj in fields_obj.try_iter()? {
+        fields.push(sharding_field_from_py(&field_obj?)?);
+    }
+    Ok(ShardingSpec { spec_id, fields })
+}
+
+fn sharding_field_from_py(field: &Bound<'_, PyAny>) -> PyResult<ShardingField> {
+    Ok(ShardingField {
+        field_id: get_py_value(field, "field_id")?.extract::<String>()?,
+        source_ids: get_py_value(field, "source_ids")?.extract::<Vec<i32>>()?,
+        transform: optional_string(get_py_value(field, "transform")?)?,
+        expression: optional_string(get_py_value(field, "expression")?)?,
+        result_type: get_py_value(field, "result_type")?.extract::<String>()?,
+        parameters: get_py_value(field, "parameters")?.extract::<HashMap<String, String>>()?,
+    })
+}
+
+fn get_py_value<'py>(obj: &Bound<'py, PyAny>, name: &str) -> PyResult<Bound<'py, PyAny>> {
+    if let Ok(dict) = obj.cast::<PyDict>() {
+        dict.get_item(name)?
+            .ok_or_else(|| PyValueError::new_err(format!("Missing sharding spec field '{name}'")))
+    } else {
+        obj.getattr(name)
+    }
+}
+
+fn optional_string(value: Bound<'_, PyAny>) -> PyResult<Option<String>> {
+    if value.is_none() {
+        Ok(None)
+    } else {
+        value.extract::<String>().map(Some)
+    }
+}
+
+/// Points to an SSTable compacted into the base table.
+///
+/// Used with `MergeInsertBuilder.mark_sstables_as_compacted()`.
+#[pyclass(name = "_CompactedSsTable", module = "_lib")]
+pub struct PyCompactedSsTable {
+    pub shard_id: String,
     pub generation: u64,
 }
 
 #[pymethods]
-impl PyMergedGeneration {
+impl PyCompactedSsTable {
     #[new]
-    pub fn new(region_id: String, generation: u64) -> Self {
+    pub fn new(shard_id: String, generation: u64) -> Self {
         Self {
-            region_id,
+            shard_id,
             generation,
         }
     }
 
     #[getter]
-    pub fn region_id(&self) -> &str {
-        &self.region_id
+    pub fn shard_id(&self) -> &str {
+        &self.shard_id
     }
 
     #[getter]
@@ -64,42 +148,42 @@ impl PyMergedGeneration {
 
     pub fn __repr__(&self) -> String {
         format!(
-            "_MergedGeneration(region_id='{}', generation={})",
-            self.region_id, self.generation
+            "_CompactedSsTable(shard_id='{}', generation={})",
+            self.shard_id, self.generation
         )
     }
 }
 
-impl PyMergedGeneration {
-    pub fn to_lance(&self) -> PyResult<LanceMergedGeneration> {
-        let uuid = Uuid::parse_str(&self.region_id)
-            .map_err(|e| PyValueError::new_err(format!("Invalid region_id UUID: {}", e)))?;
-        Ok(LanceMergedGeneration::new(uuid, self.generation))
+impl PyCompactedSsTable {
+    pub fn to_lance(&self) -> PyResult<LanceCompactedSsTable> {
+        let uuid = Uuid::parse_str(&self.shard_id)
+            .map_err(|e| PyValueError::new_err(format!("Invalid shard_id UUID: {}", e)))?;
+        Ok(LanceCompactedSsTable::new(uuid, self.generation))
     }
 }
 
-/// Snapshot of a MemWAL region's state at a point in time.
+/// Snapshot of a MemWAL shard's state at a point in time.
 ///
-/// Used to specify which flushed generations to include when creating an
+/// Used to specify which SSTables to include when creating an
 /// `_LsmScanner`. Supports a builder pattern for adding generations.
-#[pyclass(name = "_RegionSnapshot", module = "_lib", skip_from_py_object)]
+#[pyclass(name = "_ShardSnapshot", module = "_lib", skip_from_py_object)]
 #[derive(Clone)]
-pub struct PyRegionSnapshot {
-    pub inner: RegionSnapshot,
+pub struct PyShardSnapshot {
+    pub inner: ShardSnapshot,
 }
 
 #[pymethods]
-impl PyRegionSnapshot {
+impl PyShardSnapshot {
     #[new]
-    pub fn new(region_id: String) -> PyResult<Self> {
-        let uuid = Uuid::parse_str(&region_id)
-            .map_err(|e| PyValueError::new_err(format!("Invalid region_id UUID: {}", e)))?;
+    pub fn new(shard_id: String) -> PyResult<Self> {
+        let uuid = Uuid::parse_str(&shard_id)
+            .map_err(|e| PyValueError::new_err(format!("Invalid shard_id UUID: {}", e)))?;
         Ok(Self {
-            inner: RegionSnapshot::new(uuid),
+            inner: ShardSnapshot::new(uuid),
         })
     }
 
-    /// Set the RegionSpec ID for this snapshot.
+    /// Set the sharding spec ID for this snapshot.
     pub fn with_spec_id(mut slf: PyRefMut<'_, Self>, spec_id: u32) -> PyRefMut<'_, Self> {
         slf.inner = slf.inner.clone().with_spec_id(spec_id);
         slf
@@ -114,61 +198,65 @@ impl PyRegionSnapshot {
         slf
     }
 
-    /// Add a flushed generation by its generation number and storage path.
-    pub fn with_flushed_generation(
+    /// Add an SSTable by its generation number and storage path.
+    pub fn with_sstable(
         mut slf: PyRefMut<'_, Self>,
         generation: u64,
         path: String,
     ) -> PyRefMut<'_, Self> {
-        slf.inner = slf.inner.clone().with_flushed_generation(generation, path);
+        slf.inner = slf.inner.clone().with_sstable(generation, path);
         slf
     }
 
     #[getter]
-    pub fn region_id(&self) -> String {
+    pub fn shard_id(&self) -> String {
         self.inner.shard_id.to_string()
     }
 
     pub fn __repr__(&self) -> String {
         format!(
-            "_RegionSnapshot(region_id='{}', current_gen={}, flushed_gens={})",
+            "_ShardSnapshot(shard_id='{}', current_gen={}, sstables={})",
             self.inner.shard_id,
             self.inner.current_generation,
-            self.inner.flushed_generations.len()
+            self.inner.sstables.len()
         )
     }
 }
 
-/// Long-lived stateful writer for a MemWAL region.
+/// Long-lived stateful writer for a MemWAL shard.
 ///
 /// Supports writing batches, querying statistics, creating LSM scanners,
 /// and graceful shutdown. Supports the Python context manager protocol.
-#[pyclass(name = "_RegionWriter", module = "_lib")]
-pub struct PyRegionWriter {
-    inner: Arc<TokioMutex<Option<RegionWriter>>>,
-    closed_state: Arc<TokioMutex<Option<ClosedRegionWriterState>>>,
-    region_id: Uuid,
+#[pyclass(name = "_ShardWriter", module = "_lib")]
+pub struct PyShardWriter {
+    inner: Arc<TokioMutex<Option<ShardWriter>>>,
+    closed_state: Arc<TokioMutex<Option<ClosedShardWriterState>>>,
+    shard_id: Uuid,
     dataset: Arc<LanceDataset>,
 }
 
 #[derive(Clone)]
-struct ClosedRegionWriterState {
+struct ClosedShardWriterState {
     stats: WriteStatsSnapshot,
     memtable_stats: MemTableStats,
 }
 
+fn collect_record_batches(data: &Bound<'_, PyAny>) -> PyResult<Vec<RecordBatch>> {
+    let reader = ArrowArrayStreamReader::from_pyarrow_bound(data)
+        .map_err(|e| PyValueError::new_err(format!("Cannot read data as Arrow: {}", e)))?;
+    reader
+        .collect::<Result<_, _>>()
+        .map_err(|e| PyIOError::new_err(format!("Failed to read batches: {}", e)))
+}
+
 #[pymethods]
-impl PyRegionWriter {
+impl PyShardWriter {
     /// Write data batches to the MemWAL.
     ///
     /// Accepts any PyArrow-compatible data source (RecordBatch, Table,
     /// or an Arrow stream reader).
     pub fn put(&self, py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<()> {
-        let reader = ArrowArrayStreamReader::from_pyarrow_bound(data)
-            .map_err(|e| PyValueError::new_err(format!("Cannot read data as Arrow: {}", e)))?;
-        let batches: Vec<RecordBatch> = reader
-            .collect::<Result<_, _>>()
-            .map_err(|e| PyIOError::new_err(format!("Failed to read batches: {}", e)))?;
+        let batches = collect_record_batches(data)?;
 
         if batches.is_empty() {
             return Ok(());
@@ -180,7 +268,32 @@ impl PyRegionWriter {
             match guard.as_ref() {
                 Some(writer) => writer.put(batches).await.map(|_| ()),
                 None => Err(lance_core::Error::invalid_input(
-                    "RegionWriter is already closed",
+                    "ShardWriter is already closed",
+                )),
+            }
+        })?
+        .map_err(|e: lance::Error| PyIOError::new_err(e.to_string()))
+    }
+
+    /// Delete rows from the MemWAL by primary key.
+    ///
+    /// Accepts any PyArrow-compatible data source carrying the shard's primary
+    /// key column(s). Rust core validates that primary keys exist and builds the
+    /// tombstone rows.
+    pub fn delete(&self, py: Python<'_>, keys: &Bound<'_, PyAny>) -> PyResult<()> {
+        let batches = collect_record_batches(keys)?;
+
+        if batches.is_empty() {
+            return Ok(());
+        }
+
+        let inner = self.inner.clone();
+        rt().block_on(Some(py), async move {
+            let guard = inner.lock().await;
+            match guard.as_ref() {
+                Some(writer) => writer.delete(batches).await.map(|_| ()),
+                None => Err(lance_core::Error::invalid_input(
+                    "ShardWriter is already closed",
                 )),
             }
         })?
@@ -205,7 +318,7 @@ impl PyRegionWriter {
                 writer.close().await?;
                 let closed_memtable_stats = closed_memtable_stats(memtable_stats_before_close);
                 let mut closed_guard = closed_state.lock().await;
-                *closed_guard = Some(ClosedRegionWriterState {
+                *closed_guard = Some(ClosedShardWriterState {
                     stats: stats_snapshot,
                     memtable_stats: closed_memtable_stats,
                 });
@@ -235,7 +348,7 @@ impl PyRegionWriter {
                         .as_ref()
                         .map(|state| state.stats.clone())
                         .ok_or_else(|| {
-                            lance_core::Error::invalid_input("RegionWriter is already closed")
+                            lance_core::Error::invalid_input("ShardWriter is already closed")
                         })
                 }
             })?
@@ -247,41 +360,48 @@ impl PyRegionWriter {
     /// Return current MemTable statistics.
     ///
     /// Returns a dict with keys: row_count, batch_count, estimated_size_bytes,
-    /// generation.
+    /// index_bytes, frozen_bytes, generation.
     pub fn memtable_stats(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let inner = self.inner.clone();
         let closed_state = self.closed_state.clone();
-        let stats = rt()
+        let (stats, bytes) = rt()
             .block_on(Some(py), async move {
                 let guard = inner.lock().await;
                 match guard.as_ref() {
-                    Some(w) => w.memtable_stats().await,
+                    // Byte totals come from `memory()`, the lock-free view;
+                    // `memtable_stats` carries none.
+                    Some(w) => w
+                        .memtable_stats()
+                        .await
+                        .map(|stats| (stats, Some(w.memory()))),
                     None => {
                         let closed_guard = closed_state.lock().await;
                         closed_guard
                             .as_ref()
-                            .map(|state| state.memtable_stats.clone())
+                            // A closed writer holds nothing, so the byte totals
+                            // are zero by construction rather than stale.
+                            .map(|state| (state.memtable_stats.clone(), None))
                             .ok_or_else(|| {
-                                lance_core::Error::invalid_input("RegionWriter is already closed")
+                                lance_core::Error::invalid_input("ShardWriter is already closed")
                             })
                     }
                 }
             })?
             .map_err(|e: lance::Error| PyIOError::new_err(e.to_string()))?;
 
-        memtable_stats_to_pydict(py, &stats)
+        memtable_stats_to_pydict(py, &stats, bytes.as_ref())
     }
 
     /// Create an LSM scanner that includes the active MemTable for strong consistency.
     ///
-    /// The scanner covers: base table + given flushed generations + current active MemTable.
-    #[pyo3(signature = (region_snapshots=vec![]))]
+    /// The scanner covers: base table + given SSTables + current active MemTable.
+    #[pyo3(signature = (shard_snapshots=vec![]))]
     pub fn lsm_scanner(
         &self,
         py: Python<'_>,
-        region_snapshots: Vec<Bound<'_, PyRegionSnapshot>>,
+        shard_snapshots: Vec<Bound<'_, PyShardSnapshot>>,
     ) -> PyResult<PyLsmScanner> {
-        let mut snapshots: Vec<RegionSnapshot> = region_snapshots
+        let mut snapshots: Vec<ShardSnapshot> = shard_snapshots
             .iter()
             .map(|s| s.borrow().inner.clone())
             .collect();
@@ -289,7 +409,7 @@ impl PyRegionWriter {
         let pk_columns = get_pk_columns(&self.dataset)?;
         let inner = self.inner.clone();
         let dataset = self.dataset.clone();
-        let region_id = self.region_id;
+        let shard_id = self.shard_id;
 
         let (active_ref, writer_snapshot) = rt()
             .block_on(Some(py), async move {
@@ -300,31 +420,31 @@ impl PyRegionWriter {
                         let writer_snapshot = w
                             .manifest()
                             .await?
-                            .map(region_snapshot_from_manifest)
-                            .unwrap_or_else(|| RegionSnapshot::new(region_id));
+                            .map(shard_snapshot_from_manifest)
+                            .unwrap_or_else(|| ShardSnapshot::new(shard_id));
                         Ok((active_ref, writer_snapshot))
                     }
                     None => Err(lance_core::Error::invalid_input(
-                        "RegionWriter is already closed",
+                        "ShardWriter is already closed",
                     )),
                 }
             })?
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
-        snapshots.retain(|snapshot| snapshot.shard_id != region_id);
+        snapshots.retain(|snapshot| snapshot.shard_id != shard_id);
         snapshots.push(writer_snapshot);
 
         let scanner = LsmScanner::new(dataset, snapshots, pk_columns)
-            .with_active_memtable(region_id, active_ref);
+            .with_active_memtable(shard_id, active_ref);
 
         Ok(PyLsmScanner {
             inner: Some(scanner),
         })
     }
 
-    /// Return the region ID as a UUID string.
+    /// Return the shard ID as a UUID string.
     #[getter]
-    pub fn region_id(&self) -> String {
-        self.region_id.to_string()
+    pub fn shard_id(&self) -> String {
+        self.shard_id.to_string()
     }
 
     pub fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
@@ -343,13 +463,13 @@ impl PyRegionWriter {
     }
 }
 
-impl PyRegionWriter {
-    /// Create from a Rust RegionWriter and dataset reference.
-    pub fn new(writer: RegionWriter, region_id: Uuid, dataset: Arc<LanceDataset>) -> Self {
+impl PyShardWriter {
+    /// Create from a Rust ShardWriter and dataset reference.
+    pub fn new(writer: ShardWriter, shard_id: Uuid, dataset: Arc<LanceDataset>) -> Self {
         Self {
             inner: Arc::new(TokioMutex::new(Some(writer))),
             closed_state: Arc::new(TokioMutex::new(None)),
-            region_id,
+            shard_id,
             dataset,
         }
     }
@@ -427,7 +547,7 @@ impl PyExecutionPlan {
     }
 }
 
-/// LSM-aware scanner covering base table, flushed MemTables, and active MemTable.
+/// LSM-aware scanner covering base table, SSTables, and active MemTable.
 ///
 /// Provides deduplication by primary key, always returning the newest version
 /// of each row across all LSM levels.
@@ -438,14 +558,14 @@ pub struct PyLsmScanner {
 
 #[pymethods]
 impl PyLsmScanner {
-    /// Create a scanner from dataset and region snapshots (without active MemTable).
+    /// Create a scanner from dataset and shard snapshots (without active MemTable).
     #[staticmethod]
     pub fn from_snapshots(
         dataset: &Bound<'_, PyDataset>,
-        region_snapshots: Vec<Bound<'_, PyRegionSnapshot>>,
+        shard_snapshots: Vec<Bound<'_, PyShardSnapshot>>,
     ) -> PyResult<Self> {
         let ds = dataset.borrow().ds.clone();
-        let snapshots: Vec<RegionSnapshot> = region_snapshots
+        let snapshots: Vec<ShardSnapshot> = shard_snapshots
             .iter()
             .map(|s| s.borrow().inner.clone())
             .collect();
@@ -465,7 +585,11 @@ impl PyLsmScanner {
             .take()
             .ok_or_else(|| PyRuntimeError::new_err("Scanner has already been consumed"))?;
         let cols: Vec<&str> = columns.iter().map(|s| s.as_str()).collect();
-        slf.inner = Some(scanner.project(&cols));
+        slf.inner = Some(
+            scanner
+                .project(&cols)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?,
+        );
         Ok(slf)
     }
 
@@ -483,18 +607,22 @@ impl PyLsmScanner {
         Ok(slf)
     }
 
-    /// Limit the number of rows returned.
-    #[pyo3(signature = (n, offset=None))]
+    /// Limit the number of rows returned, optionally with an offset.
+    #[pyo3(signature = (n=None, offset=None))]
     pub fn limit(
         mut slf: PyRefMut<'_, Self>,
-        n: usize,
+        n: Option<usize>,
         offset: Option<usize>,
     ) -> PyResult<PyRefMut<'_, Self>> {
         let scanner = slf
             .inner
             .take()
             .ok_or_else(|| PyRuntimeError::new_err("Scanner has already been consumed"))?;
-        slf.inner = Some(scanner.limit(n, offset));
+        slf.inner = Some(
+            scanner
+                .limit(n.map(|n| n as i64), offset.map(|o| o as i64))
+                .map_err(|e| PyValueError::new_err(e.to_string()))?,
+        );
         Ok(slf)
     }
 
@@ -584,14 +712,14 @@ pub struct PyLsmPointLookupPlanner {
 #[pymethods]
 impl PyLsmPointLookupPlanner {
     #[new]
-    #[pyo3(signature = (dataset, region_snapshots, pk_columns=None))]
+    #[pyo3(signature = (dataset, shard_snapshots, pk_columns=None))]
     pub fn new(
         dataset: &Bound<'_, PyDataset>,
-        region_snapshots: Vec<Bound<'_, PyRegionSnapshot>>,
+        shard_snapshots: Vec<Bound<'_, PyShardSnapshot>>,
         pk_columns: Option<Vec<String>>,
     ) -> PyResult<Self> {
         let ds = dataset.borrow().ds.clone();
-        let snapshots: Vec<RegionSnapshot> = region_snapshots
+        let snapshots: Vec<ShardSnapshot> = shard_snapshots
             .iter()
             .map(|s| s.borrow().inner.clone())
             .collect();
@@ -600,8 +728,13 @@ impl PyLsmPointLookupPlanner {
             None => get_pk_columns(&ds)?,
         };
         let base_schema = Arc::new(ArrowSchema::from(ds.schema()));
+        // A sealed generation stores the names it was written with, so the
+        // planner resolves its columns by id; `base_schema` carries none.
+        let identity_schema = Arc::new(arrow_schema_with_field_ids(ds.schema()));
         let collector = LsmDataSourceCollector::new(ds.clone(), snapshots);
-        let planner = LsmPointLookupPlanner::new(collector, pk_cols.clone(), base_schema.clone());
+        let planner = LsmPointLookupPlanner::new(collector, pk_cols.clone(), base_schema.clone())
+            .map_err(|e| PyIOError::new_err(e.to_string()))?
+            .with_identity_schema(identity_schema);
         Ok(Self {
             planner,
             dataset_schema: base_schema,
@@ -649,16 +782,17 @@ pub struct PyLsmVectorSearchPlanner {
 #[pymethods]
 impl PyLsmVectorSearchPlanner {
     #[new]
-    #[pyo3(signature = (dataset, region_snapshots, vector_column, pk_columns=None, distance_type=None))]
+    #[pyo3(signature = (dataset, shard_snapshots, vector_column, pk_columns=None, distance_type=None, filter=None))]
     pub fn new(
         dataset: &Bound<'_, PyDataset>,
-        region_snapshots: Vec<Bound<'_, PyRegionSnapshot>>,
+        shard_snapshots: Vec<Bound<'_, PyShardSnapshot>>,
         vector_column: String,
         pk_columns: Option<Vec<String>>,
         distance_type: Option<String>,
+        filter: Option<String>,
     ) -> PyResult<Self> {
         let ds = dataset.borrow().ds.clone();
-        let snapshots: Vec<RegionSnapshot> = region_snapshots
+        let snapshots: Vec<ShardSnapshot> = shard_snapshots
             .iter()
             .map(|s| s.borrow().inner.clone())
             .collect();
@@ -667,19 +801,33 @@ impl PyLsmVectorSearchPlanner {
             None => get_pk_columns(&ds)?,
         };
         let base_schema = Arc::new(ArrowSchema::from(ds.schema()));
+        // See the point-lookup planner: a rename moves a name and keeps the id.
+        let identity_schema = Arc::new(arrow_schema_with_field_ids(ds.schema()));
 
         let dist_type = parse_distance_type(distance_type.as_deref().unwrap_or("l2"))?;
 
         let vector_dim = get_vector_dim(&ds, &vector_column)?;
+        let filter = filter
+            .as_deref()
+            .map(|filter| {
+                parse_lsm_filter_expr(base_schema.as_ref(), filter)
+                    .map_err(|e| PyValueError::new_err(e.to_string()))
+            })
+            .transpose()?;
 
-        let collector = LsmDataSourceCollector::new(ds, snapshots);
-        let planner = LsmVectorSearchPlanner::new(
+        let collector = LsmDataSourceCollector::new(ds.clone(), snapshots);
+        let mut planner = LsmVectorSearchPlanner::new(
             collector,
             pk_cols,
             base_schema.clone(),
             vector_column,
             dist_type,
-        );
+        )
+        .with_identity_schema(identity_schema)
+        .with_dataset(ds);
+        if let Some(filter) = filter {
+            planner = planner.with_filter(Some(filter));
+        }
 
         Ok(Self {
             planner,
@@ -691,7 +839,8 @@ impl PyLsmVectorSearchPlanner {
     /// Plan a KNN vector search.
     ///
     /// `query` should be a flat PyArrow Float32Array with `vector_dim` elements.
-    #[pyo3(signature = (query, k=10, nprobes=20, columns=None))]
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (query, k=10, nprobes=20, columns=None, refine_base_table=false, overfetch_factor=1.0))]
     pub fn plan_search(
         &self,
         py: Python<'_>,
@@ -699,6 +848,8 @@ impl PyLsmVectorSearchPlanner {
         k: usize,
         nprobes: usize,
         columns: Option<Vec<String>>,
+        refine_base_table: bool,
+        overfetch_factor: f64,
     ) -> PyResult<PyExecutionPlan> {
         let query_array = make_array(query.0);
         let float32_array = query_array
@@ -732,7 +883,14 @@ impl PyLsmVectorSearchPlanner {
         let plan = rt()
             .block_on(Some(py), async {
                 planner_ref
-                    .plan_search(&fsl, k, nprobes, columns.as_deref())
+                    .plan_search(
+                        &fsl,
+                        k,
+                        nprobes,
+                        columns.as_deref(),
+                        refine_base_table,
+                        overfetch_factor,
+                    )
                     .await
             })?
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
@@ -799,12 +957,53 @@ fn write_stats_to_pydict(py: Python<'_>, stats: &WriteStatsSnapshot) -> PyResult
     Ok(dict.into_any().unbind())
 }
 
-fn memtable_stats_to_pydict(py: Python<'_>, stats: &MemTableStats) -> PyResult<Py<PyAny>> {
+fn memtable_stats_to_pydict(
+    py: Python<'_>,
+    stats: &MemTableStats,
+    bytes: Option<&ShardMemory>,
+) -> PyResult<Py<PyAny>> {
     let dict = PyDict::new(py);
     dict.set_item("row_count", stats.row_count)?;
     dict.set_item("batch_count", stats.batch_count)?;
-    dict.set_item("estimated_size_bytes", stats.estimated_size)?;
+    // Row data only, as this key has always meant; `index_bytes` below is the
+    // rest of the active memtable's footprint.
+    dict.set_item(
+        "estimated_size_bytes",
+        bytes.map_or(0, ShardMemory::row_bytes),
+    )?;
+    dict.set_item("index_bytes", bytes.map_or(0, ShardMemory::index_bytes))?;
     dict.set_item("generation", stats.generation)?;
+    dict.set_item(
+        "max_buffered_batch_position",
+        stats.max_buffered_batch_position,
+    )?;
+    dict.set_item("durable_batch_count", stats.durable_batch_count)?;
+    dict.set_item("global_offset", stats.global_offset)?;
+    dict.set_item(
+        "pending_wal_start_batch_position",
+        stats.pending_wal_start_batch_position,
+    )?;
+    dict.set_item(
+        "pending_wal_end_batch_position",
+        stats.pending_wal_end_batch_position,
+    )?;
+    dict.set_item("pending_wal_batch_count", stats.pending_wal_batch_count)?;
+    dict.set_item("pending_wal_row_count", stats.pending_wal_row_count)?;
+    dict.set_item(
+        "pending_wal_estimated_bytes",
+        stats.pending_wal_estimated_bytes,
+    )?;
+    dict.set_item("frozen_count", stats.frozen_count)?;
+    dict.set_item("frozen_bytes", bytes.map_or(0, ShardMemory::frozen_bytes))?;
+    // Flushed generations still lingering out `frozen_memtable_grace`. Resident,
+    // but no flush reclaims them, so they are not in `frozen_bytes`.
+    dict.set_item("grace_bytes", bytes.map_or(0, ShardMemory::grace_bytes))?;
+    // The whole footprint: what a process-wide budget meters, as opposed to
+    // `frozen_bytes` + active, which is only what a flush can give back.
+    dict.set_item(
+        "retained_bytes",
+        bytes.map_or(0, ShardMemory::retained_bytes),
+    )?;
     Ok(dict.into_any().unbind())
 }
 
@@ -856,31 +1055,50 @@ fn scalar_values_from_pk_value(
     Ok(pk_values)
 }
 
-fn region_snapshot_from_manifest(manifest: lance_index::mem_wal::ShardManifest) -> RegionSnapshot {
-    RegionSnapshot {
+fn shard_snapshot_from_manifest(manifest: lance_index::mem_wal::ShardManifest) -> ShardSnapshot {
+    ShardSnapshot {
         shard_id: manifest.shard_id,
         spec_id: manifest.shard_spec_id,
         current_generation: manifest.current_generation,
-        flushed_generations: manifest
-            .flushed_generations
+        sstables: manifest
+            .sstables
             .into_iter()
-            .map(|generation| FlushedGeneration {
-                generation: generation.generation,
-                path: generation.path,
+            .map(|sstable| SsTable {
+                generation: sstable.generation,
+                path: sstable.path,
             })
             .collect(),
     }
 }
 
 fn closed_memtable_stats(stats_before_close: MemTableStats) -> MemTableStats {
+    // Close awaits every frozen memtable's flush, so nothing is owed afterwards
+    // regardless of whether the active memtable had buffered batches.
+    let stats_before_close = MemTableStats {
+        frozen_count: 0,
+        ..stats_before_close
+    };
+
     if stats_before_close.batch_count == 0 {
         return stats_before_close;
     }
 
+    // After a successful close every buffered batch is flushed and WAL-durable,
+    // so the synthesized empty memtable starts at the writer's global end and the
+    // durable cursor has caught up to it.
+    let global_end = stats_before_close.global_offset + stats_before_close.batch_count;
     MemTableStats {
         row_count: 0,
         batch_count: 0,
-        estimated_size: 0,
         generation: stats_before_close.generation.saturating_add(1),
+        max_buffered_batch_position: None,
+        durable_batch_count: global_end,
+        global_offset: global_end,
+        pending_wal_start_batch_position: None,
+        pending_wal_end_batch_position: None,
+        pending_wal_batch_count: 0,
+        pending_wal_row_count: 0,
+        pending_wal_estimated_bytes: 0,
+        frozen_count: 0,
     }
 }

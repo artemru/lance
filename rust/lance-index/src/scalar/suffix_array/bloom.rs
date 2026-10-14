@@ -146,9 +146,11 @@ impl BloomFilter {
             return None;
         }
         let bits: Vec<u64> = data[12..]
-            .chunks_exact(8)
+            .as_chunks::<8>()
+            .0
+            .iter()
             .take(num_words)
-            .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
+            .map(|chunk| u64::from_le_bytes(*chunk))
             .collect();
         Some(Self {
             bits,

@@ -307,7 +307,7 @@ pub fn next_byte_distribution(
             prob: cnt as f64 / prompt_cnt as f64,
         })
         .collect();
-    distribution.sort_by(|a, b| b.count.cmp(&a.count));
+    distribution.sort_by_key(|e| std::cmp::Reverse(e.count));
 
     NtdResult {
         prompt_cnt,
@@ -780,7 +780,7 @@ pub async fn next_byte_distribution_cached(
             prob: cnt as f64 / prompt_cnt as f64,
         })
         .collect();
-    distribution.sort_by(|a, b| b.count.cmp(&a.count));
+    distribution.sort_by_key(|e| std::cmp::Reverse(e.count));
 
     Ok(NtdResult {
         prompt_cnt,

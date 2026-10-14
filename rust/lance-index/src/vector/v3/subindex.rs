@@ -1,17 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::{BinaryHeap, HashMap};
+use lance_core::utils::row_addr_remap::RowAddrRemap;
+use std::collections::BinaryHeap;
 use std::fmt::Debug;
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, RecordBatch};
-use deepsize::DeepSizeOf;
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 
 use crate::metrics::MetricsCollector;
 use crate::vector::graph::OrderedNode;
-use crate::vector::storage::VectorStore;
+use crate::vector::storage::{QueryResidual, QueryScratch, VectorStore};
 use crate::vector::{flat, hnsw};
 use crate::{prefilter::PreFilter, vector::Query};
 /// A sub index for IVF index
@@ -31,6 +32,15 @@ pub trait IvfSubIndex: Send + Sync + Debug + DeepSizeOf {
     /// Return the schema of the sub index
     fn schema() -> arrow_schema::SchemaRef;
 
+    /// The subset of [`Self::schema`] that [`Self::load`] actually reads.
+    ///
+    /// Index files always carry the full `schema()`, so narrowing the read is
+    /// purely a storage optimization: it keeps write-only columns from being
+    /// fetched, without changing what is written. `None` reads every column.
+    fn read_columns() -> Option<&'static [&'static str]> {
+        None
+    }
+
     /// Search the sub index for nearest neighbors.
     /// # Arguments:
     /// * `query` - The query vector
@@ -46,6 +56,22 @@ pub trait IvfSubIndex: Send + Sync + Debug + DeepSizeOf {
         prefilter: Arc<dyn PreFilter>,
         metrics: &dyn MetricsCollector,
     ) -> Result<RecordBatch>;
+
+    /// Search the sub-index, reusing scratch buffers owned by the caller.
+    #[allow(clippy::too_many_arguments)]
+    fn search_with_scratch(
+        &self,
+        query: ArrayRef,
+        k: usize,
+        params: Self::QueryParams,
+        storage: &impl VectorStore,
+        prefilter: Arc<dyn PreFilter>,
+        metrics: &dyn MetricsCollector,
+        _residual: Option<QueryResidual<'_>>,
+        _scratch: &mut QueryScratch,
+    ) -> Result<RecordBatch> {
+        self.search(query, k, params, storage, prefilter, metrics)
+    }
 
     /// Return true if this sub-index can accumulate candidates into a caller-owned heap.
     fn supports_global_topk_heap() -> bool {
@@ -78,9 +104,8 @@ pub trait IvfSubIndex: Send + Sync + Debug + DeepSizeOf {
         storage: &impl VectorStore,
         prefilter: Arc<dyn PreFilter>,
         heap: &mut BinaryHeap<OrderedNode<u64>>,
-        _distance_scratch: &mut Vec<f32>,
-        _u16_scratch: &mut Vec<u16>,
-        _u8_scratch: &mut Vec<u8>,
+        _residual: Option<QueryResidual<'_>>,
+        _scratch: &mut QueryScratch,
         metrics: &dyn MetricsCollector,
     ) -> Result<()> {
         self.accumulate_topk(query, k, params, storage, prefilter, heap, metrics)
@@ -91,7 +116,7 @@ pub trait IvfSubIndex: Send + Sync + Debug + DeepSizeOf {
     where
         Self: Sized;
 
-    fn remap(&self, mapping: &HashMap<u64, Option<u64>>, store: &impl VectorStore) -> Result<Self>
+    fn remap(&self, mapping: &RowAddrRemap, store: &impl VectorStore) -> Result<Self>
     where
         Self: Sized;
 

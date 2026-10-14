@@ -9,22 +9,24 @@ use std::{
 };
 
 use object_store::ObjectStore as OSObjectStore;
-use object_store_opendal::OpendalStore;
+use object_store::list::PaginatedListStore;
 use opendal::{Operator, services::Azblob, services::Azdls};
 
 use object_store::{
     RetryConfig,
-    azure::{AzureConfigKey, AzureCredential, MicrosoftAzureBuilder},
+    azure::{AzureConfigKey, AzureCredential, MicrosoftAzure, MicrosoftAzureBuilder},
 };
 use url::Url;
 
+use crate::object_store::opendal_store::OpendalStore;
 use crate::object_store::{
     DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
     ObjectStoreParams, ObjectStoreProvider, StorageOptions, StorageOptionsAccessor,
     dynamic_credentials::build_dynamic_credential_provider,
-    throttle::{AimdThrottleConfig, AimdThrottledStore},
+    throttle::{AimdThrottleState, cloud_http_connector, shared_throttle_state, with_throttling},
 };
 use lance_core::error::{Error, Result};
+use lance_core::utils::parse::str_is_truthy;
 
 #[derive(Default, Debug)]
 pub struct AzureBlobStoreProvider;
@@ -106,14 +108,9 @@ impl AzureBlobStoreProvider {
                     config_map.insert("root".to_string(), format!("/{}", prefix));
                 }
 
-                Operator::from_iter::<Azblob>(config_map)
-                    .map_err(|e| {
-                        Error::invalid_input(format!(
-                            "Failed to create Azure Blob operator: {:?}",
-                            e
-                        ))
-                    })
-                    .map(|b| b.finish())
+                Operator::from_iter::<Azblob>(config_map).map_err(|e| {
+                    Error::invalid_input(format!("Failed to create Azure Blob operator: {:?}", e))
+                })
             }
             "abfss" => {
                 let filesystem = base_path.username();
@@ -139,14 +136,12 @@ impl AzureBlobStoreProvider {
                     config_map.insert("root".to_string(), format!("/{}", root_path));
                 }
 
-                Operator::from_iter::<Azdls>(config_map)
-                    .map_err(|e| {
-                        Error::invalid_input(format!(
-                            "Failed to create Azure DFS (ADLS Gen2) operator: {:?}",
-                            e
-                        ))
-                    })
-                    .map(|b| b.finish())
+                Operator::from_iter::<Azdls>(config_map).map_err(|e| {
+                    Error::invalid_input(format!(
+                        "Failed to create Azure DFS (ADLS Gen2) operator: {:?}",
+                        e
+                    ))
+                })
             }
             _ => Err(Error::invalid_input(format!(
                 "Unsupported Azure scheme: {}",
@@ -169,7 +164,10 @@ impl AzureBlobStoreProvider {
         base_path: &Url,
         storage_options: &StorageOptions,
         accessor: Option<Arc<StorageOptionsAccessor>>,
-    ) -> Result<Arc<dyn OSObjectStore>> {
+        throttle_state: Option<&AimdThrottleState>,
+        // Concrete rather than `dyn`, so the caller keeps the handle a paginated listing
+        // needs: `PaginatedListStore` is a separate trait from `ObjectStore`.
+    ) -> Result<Arc<MicrosoftAzure>> {
         // Use a low retry count since the AIMD throttle layer handles
         // throttle recovery with its own retry loop.
         let retry_config = RetryConfig {
@@ -192,7 +190,14 @@ impl AzureBlobStoreProvider {
             builder = builder.with_credentials(credentials);
         }
 
-        Ok(Arc::new(builder.build()?) as Arc<dyn OSObjectStore>)
+        let store_prefix =
+            self.calculate_object_store_prefix(base_path, Some(&storage_options.0))?;
+        builder = builder.with_http_connector(cloud_http_connector(
+            throttle_state,
+            crate::object_store::metrics_base(&store_prefix, base_path),
+        ));
+
+        Ok(Arc::new(builder.build()?))
     }
 
     fn calculate_object_store_prefix_with_env(
@@ -252,46 +257,57 @@ impl ObjectStoreProvider for AzureBlobStoreProvider {
         let use_opendal = storage_options
             .0
             .get("use_opendal")
-            .map(|v| v.as_str() == "true")
+            .map(|v| str_is_truthy(v.as_str()))
             .unwrap_or(false);
 
         let accessor = params.get_accessor();
 
-        let inner: Arc<dyn OSObjectStore> = if use_opendal {
+        // Keyed like the registry cache so per-dataset stores share the bucket's budget.
+        let store_prefix =
+            self.calculate_object_store_prefix(&base_path, params.storage_options())?;
+        let throttle_state = shared_throttle_state(&store_prefix, params)?;
+
+        let (inner, paginated_lister) = if use_opendal {
             // OpenDAL Azure intentionally uses static/environment-backed configuration only.
             // Namespace-vended dynamic credentials are supported on the native object_store path.
-            self.build_opendal_azure_store(&base_path, &storage_options)
-                .await?
+            // Listed in full: no paginated lister covers OpenDAL yet.
+            (
+                self.build_opendal_azure_store(&base_path, &storage_options)
+                    .await?,
+                None,
+            )
         } else {
-            self.build_microsoft_azure_store(&base_path, &storage_options, accessor)
-                .await?
+            let store = self
+                .build_microsoft_azure_store(
+                    &base_path,
+                    &storage_options,
+                    accessor,
+                    throttle_state.as_ref(),
+                )
+                .await?;
+            (
+                store.clone() as Arc<dyn OSObjectStore>,
+                Some(store as Arc<dyn PaginatedListStore>),
+            )
         };
-        let throttle_config = AimdThrottleConfig::from_storage_options(params.storage_options())?;
-        let inner = if throttle_config.is_disabled() {
-            inner
-        } else if storage_options.client_max_retries() == 0 {
-            log::warn!(
-                "AIMD throttle disabled: the current implementation relies on the object store \
-                 client surfacing retry errors, which requires client_max_retries > 0. \
-                 No throttle or retry layer will be applied."
-            );
-            inner
-        } else {
-            Arc::new(AimdThrottledStore::new(inner, throttle_config)?) as Arc<dyn OSObjectStore>
-        };
+        let (inner, paginated_lister) =
+            with_throttling(throttle_state, !use_opendal, inner, paginated_lister);
 
         Ok(ObjectStore {
             inner,
+            local_dir_operations: None,
             scheme,
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
             use_constant_size_upload_parts: false,
+            supports_conditional_multipart_put: false,
             list_is_lexically_ordered: true,
             io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
             download_retry_count,
             io_tracker: Default::default(),
             store_prefix: self
                 .calculate_object_store_prefix(&base_path, params.storage_options())?,
+            paginated_lister,
         })
     }
 
@@ -320,24 +336,36 @@ impl StorageOptions {
         Self(opts)
     }
 
-    /// Add values from the environment to storage options
+    /// Add values from the environment without overriding explicit options,
+    /// including aliases, case variants, and empty-string values.
     pub fn with_env_azure(&mut self) {
-        for (os_key, os_value) in &ENV_OPTIONS.0 {
-            if !self.0.contains_key(os_key) {
-                self.0.insert(os_key.clone(), os_value.clone());
-            }
-        }
+        self.merge_env_options(&ENV_OPTIONS.0, |key| {
+            AzureConfigKey::from_str(key)
+                .ok()
+                .map(|key| key.as_ref().to_string())
+        });
     }
 
-    /// Subset of options relevant for azure storage
+    /// Return options recognized by [`AzureConfigKey`], ignoring unknown keys.
+    ///
+    /// When aliases conflict, the exact canonical name (such as
+    /// `azure_storage_account_name`) wins, followed by case variants of that name.
+    /// Remaining ties use the lexicographically smallest original key. Empty
+    /// values are preserved.
+    ///
+    /// ```
+    /// use std::collections::HashMap;
+    /// use lance_io::object_store::StorageOptions;
+    /// use object_store::azure::AzureConfigKey;
+    ///
+    /// let options = StorageOptions(HashMap::from([
+    ///     ("account_name".into(), "alias".into()),
+    ///     ("azure_storage_account_name".into(), "canonical".into()),
+    /// ]));
+    /// assert_eq!(options.as_azure_options()[&AzureConfigKey::AccountName], "canonical");
+    /// ```
     pub fn as_azure_options(&self) -> HashMap<AzureConfigKey, String> {
-        self.0
-            .iter()
-            .filter_map(|(key, value)| {
-                let az_key = AzureConfigKey::from_str(&key.to_ascii_lowercase()).ok()?;
-                Some((az_key, value.clone()))
-            })
-            .collect()
+        self.as_cloud_options()
     }
 
     #[allow(clippy::manual_map)]
@@ -360,6 +388,36 @@ mod tests {
     use crate::object_store::test_utils::StaticMockStorageOptionsProvider;
     use crate::object_store::{ObjectStoreParams, StorageOptionsAccessor};
     use std::collections::HashMap;
+
+    #[rstest::rstest]
+    #[case::canonical("azure_storage_account_name", "account_name")]
+    #[case::canonical_over_case_variant("azure_storage_account_name", "AZURE_STORAGE_ACCOUNT_NAME")]
+    #[case::canonical_case_tie("AZURE_STORAGE_ACCOUNT_NAME", "Azure_Storage_Account_Name")]
+    #[case::case_variant_over_alias("AZURE_STORAGE_ACCOUNT_NAME", "account_name")]
+    #[case::lexical_alias("ACCOUNT_NAME", "account_name")]
+    fn test_storage_options_alias_precedence(
+        #[case] preferred_key: &str,
+        #[case] conflicting_key: &str,
+        #[values("preferred", "")] preferred_value: &str,
+        #[values(false, true)] is_reversed: bool,
+    ) {
+        // Exercise fresh hash seeds as well as both insertion orders.
+        for _ in 0..16 {
+            let mut entries = [
+                (preferred_key.to_string(), preferred_value.to_string()),
+                (conflicting_key.to_string(), "conflicting".to_string()),
+                ("lance_custom_option".to_string(), "ignored".to_string()),
+            ];
+            if is_reversed {
+                entries.reverse();
+            }
+            let options = StorageOptions(HashMap::from(entries));
+            assert_eq!(
+                options.as_azure_options(),
+                HashMap::from([(AzureConfigKey::AccountName, preferred_value.to_string())])
+            );
+        }
+    }
 
     #[test]
     fn test_azure_store_path() {
@@ -572,6 +630,29 @@ mod tests {
             "abfss:// without use_opendal should use MicrosoftAzureBuilder, got: {}",
             inner_desc
         );
+        assert!(
+            store.paginated_lister.is_some(),
+            "the native store pages an ADLS Gen2 account by continuation token"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_blob_container_is_paged() {
+        use crate::object_store::StorageOptionsAccessor;
+        let provider = AzureBlobStoreProvider;
+        let url = Url::parse("az://container@testaccount.blob.core.windows.net/data").unwrap();
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([
+                    ("account_name".to_string(), "testaccount".to_string()),
+                    ("account_key".to_string(), "dGVzdA==".to_string()),
+                ]),
+            ))),
+            ..Default::default()
+        };
+
+        let store = provider.new_store(url, &params).await.unwrap();
+        assert!(store.paginated_lister.is_some());
     }
 
     #[tokio::test]
@@ -649,8 +730,8 @@ mod tests {
         let abfss_operator =
             AzureBlobStoreProvider::build_opendal_operator(&abfss_url, &common_opts).unwrap();
 
-        let azblob_cap = az_operator.info().native_capability();
-        let azdls_cap = abfss_operator.info().native_capability();
+        let azblob_cap = az_operator.info().capability();
+        let azdls_cap = abfss_operator.info().capability();
 
         // Both support basic operations
         assert!(azblob_cap.read);

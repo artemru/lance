@@ -6,14 +6,89 @@ use log::trace;
 use crate::{
     Result,
     buffer::LanceBuffer,
-    compression::MiniBlockDecompressor,
+    compression::{
+        BlockCompressor, BlockDecompressor, MiniBlockDecompressor, require_block_payload,
+    },
     data::DataBlock,
     encodings::{
-        logical::primitive::miniblock::{MiniBlockCompressed, MiniBlockCompressor},
+        logical::primitive::miniblock::{
+            MiniBlockCompressed, MiniBlockCompressionContext, MiniBlockCompressor,
+        },
         physical::block::{CompressionConfig, GeneralBufferCompressor},
     },
     format::{ProtobufUtils21, pb21::CompressiveEncoding},
 };
+use lance_core::Error;
+
+/// General-purpose compressor that wraps one payload-bearing block codec.
+#[derive(Debug)]
+pub struct GeneralBlockCompressor {
+    child: Box<dyn BlockCompressor>,
+    compression: CompressionConfig,
+}
+
+impl GeneralBlockCompressor {
+    pub fn new(child: Box<dyn BlockCompressor>, compression: CompressionConfig) -> Self {
+        Self { child, compression }
+    }
+}
+
+impl BlockCompressor for GeneralBlockCompressor {
+    fn compress(&self, data: DataBlock) -> Result<(Option<LanceBuffer>, CompressiveEncoding)> {
+        let (payload, child_encoding) = self.child.compress(data)?;
+        let payload = payload.ok_or_else(|| {
+            Error::invalid_input("General block compression requires a payload-bearing child")
+        })?;
+        let compressor = GeneralBufferCompressor::get_compressor(self.compression)?;
+        let mut compressed = Vec::new();
+        compressor.compress(&payload, &mut compressed)?;
+        Ok((
+            Some(LanceBuffer::from(compressed)),
+            ProtobufUtils21::wrapped(self.compression, child_encoding)?,
+        ))
+    }
+}
+
+/// Bounded fixed-width decoder for a general-compressed block payload.
+#[derive(Debug)]
+pub(crate) struct FixedWidthGeneralBlockDecompressor {
+    child: Box<dyn BlockDecompressor>,
+    compression: CompressionConfig,
+    bits_per_value: u64,
+}
+
+impl FixedWidthGeneralBlockDecompressor {
+    pub(crate) fn new(
+        child: Box<dyn BlockDecompressor>,
+        compression: CompressionConfig,
+        bits_per_value: u64,
+    ) -> Self {
+        Self {
+            child,
+            compression,
+            bits_per_value,
+        }
+    }
+}
+
+impl BlockDecompressor for FixedWidthGeneralBlockDecompressor {
+    fn decompress(&self, data: Option<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
+        let data = require_block_payload(data, "General fixed-width block")?;
+        let expected_bytes = usize::try_from(num_values)
+            .ok()
+            .and_then(|num_values| {
+                num_values.checked_mul(usize::try_from(self.bits_per_value / 8).ok()?)
+            })
+            .ok_or_else(|| {
+                Error::invalid_input("General fixed-width output length overflows usize")
+            })?;
+        let compressor = GeneralBufferCompressor::get_compressor(self.compression)?;
+        let mut decompressed = Vec::new();
+        compressor.decompress_exact(&data, &mut decompressed, expected_bytes)?;
+        self.child
+            .decompress(Some(LanceBuffer::from(decompressed)), num_values)
+    }
+}
 
 /// A miniblock compressor that wraps another miniblock compressor and applies
 /// general-purpose compression (LZ4, Zstd) to the resulting buffers.
@@ -35,9 +110,13 @@ const MIN_BUFFER_SIZE_FOR_COMPRESSION: usize = 4 * 1024;
 use super::super::logical::primitive::miniblock::MiniBlockChunk;
 
 impl MiniBlockCompressor for GeneralMiniBlockCompressor {
-    fn compress(&self, page: DataBlock) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
+    fn compress(
+        &self,
+        context: MiniBlockCompressionContext,
+        page: DataBlock,
+    ) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
         // First, compress with the inner compressor
-        let (inner_compressed, inner_encoding) = self.inner.compress(page)?;
+        let (inner_compressed, inner_encoding) = self.inner.compress(context, page)?;
 
         // Return the original encoding without compression if there's no data or
         // the first buffer is not large enough
@@ -123,7 +202,18 @@ impl GeneralMiniBlockDecompressor {
 }
 
 impl MiniBlockDecompressor for GeneralMiniBlockDecompressor {
+    fn num_buffers(&self) -> usize {
+        self.inner.num_buffers()
+    }
+
     fn decompress(&self, mut data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
+        if data.len() != self.num_buffers() || data.is_empty() {
+            return Err(Error::invalid_input(format!(
+                "General mini-block has {} buffers, expected {}",
+                data.len(),
+                self.num_buffers()
+            )));
+        }
         let mut decompressed_buffer = Vec::new();
 
         let decompressor = GeneralBufferCompressor::get_compressor(self.compression)?;
@@ -131,6 +221,10 @@ impl MiniBlockDecompressor for GeneralMiniBlockDecompressor {
         data[0] = LanceBuffer::from(decompressed_buffer);
 
         self.inner.decompress(data, num_values)
+    }
+
+    fn decoded_size_bytes(&self, num_values: u64) -> Option<u64> {
+        self.inner.decoded_size_bytes(num_values)
     }
 }
 
@@ -145,6 +239,10 @@ mod tests {
     use crate::format::pb21;
     use crate::format::pb21::compressive_encoding::Compression;
     use arrow_array::{Float64Array, Int32Array};
+
+    fn miniblock_context() -> MiniBlockCompressionContext {
+        MiniBlockCompressionContext::new(0, true, true)
+    }
 
     #[derive(Debug)]
     struct TestCase {
@@ -161,7 +259,7 @@ mod tests {
             // Small data with RLE - should not compress due to size threshold
             TestCase {
                 name: "small_rle_data",
-                inner_encoder: Box::new(RleEncoder),
+                inner_encoder: Box::new(RleEncoder::new()),
                 compression: CompressionConfig {
                     scheme: CompressionScheme::Lz4,
                     level: None,
@@ -173,7 +271,7 @@ mod tests {
             // Large repeated data with RLE + LZ4
             TestCase {
                 name: "large_rle_lz4",
-                inner_encoder: Box::new(RleEncoder),
+                inner_encoder: Box::new(RleEncoder::new()),
                 compression: CompressionConfig {
                     scheme: CompressionScheme::Lz4,
                     level: None,
@@ -185,7 +283,7 @@ mod tests {
             // Large repeated data with RLE + Zstd
             TestCase {
                 name: "large_rle_zstd",
-                inner_encoder: Box::new(RleEncoder),
+                inner_encoder: Box::new(RleEncoder::new()),
                 compression: CompressionConfig {
                     scheme: CompressionScheme::Zstd,
                     level: Some(3),
@@ -249,7 +347,9 @@ mod tests {
             GeneralMiniBlockCompressor::new(test_case.inner_encoder, test_case.compression);
 
         // Compress the data
-        let (compressed, encoding) = compressor.compress(test_case.data).unwrap();
+        let (compressed, encoding) = compressor
+            .compress(miniblock_context(), test_case.data)
+            .unwrap();
 
         // Check if compression was applied as expected
         match &encoding.compression {
@@ -403,7 +503,7 @@ mod tests {
         // Test that small buffers don't get compressed
         let small_test = TestCase {
             name: "small_buffer_no_compression",
-            inner_encoder: Box::new(RleEncoder),
+            inner_encoder: Box::new(RleEncoder::new()),
             compression: CompressionConfig {
                 scheme: CompressionScheme::Lz4,
                 level: None,
@@ -461,7 +561,7 @@ mod tests {
         let compressor = GeneralMiniBlockCompressor::new(inner, compression);
 
         // Compress the data
-        let (compressed, encoding) = compressor.compress(block).unwrap();
+        let (compressed, encoding) = compressor.compress(miniblock_context(), block).unwrap();
 
         // Should get GeneralMiniBlock encoding since buffer is 4KB
         match &encoding.compression {
@@ -496,14 +596,14 @@ mod tests {
         // RLE produces 2 buffers (values and lengths), test that both are handled correctly
         let data = create_repeated_i32_block(vec![1; 100]);
         let compressor = GeneralMiniBlockCompressor::new(
-            Box::new(RleEncoder),
+            Box::new(RleEncoder::new()),
             CompressionConfig {
                 scheme: CompressionScheme::Lz4,
                 level: None,
             },
         );
 
-        let (compressed, _) = compressor.compress(data).unwrap();
+        let (compressed, _) = compressor.compress(miniblock_context(), data).unwrap();
         // RLE produces 2 buffers, but only the first one is compressed
         assert_eq!(compressed.data.len(), 2);
     }
@@ -519,7 +619,7 @@ mod tests {
         // Test case 1: 32-bit RLE data
         let test_32 = TestCase {
             name: "rle_32bit_with_general_wrapper",
-            inner_encoder: Box::new(RleEncoder),
+            inner_encoder: Box::new(RleEncoder::new()),
             compression: CompressionConfig {
                 scheme: CompressionScheme::Lz4,
                 level: None,
@@ -532,14 +632,16 @@ mod tests {
         // For 32-bit RLE, the compression strategy should automatically wrap it
         // Let's directly test the compressor
         let compressor = GeneralMiniBlockCompressor::new(
-            Box::new(RleEncoder),
+            Box::new(RleEncoder::new()),
             CompressionConfig {
                 scheme: CompressionScheme::Lz4,
                 level: None,
             },
         );
 
-        let (_compressed, encoding) = compressor.compress(test_32.data).unwrap();
+        let (_compressed, encoding) = compressor
+            .compress(miniblock_context(), test_32.data)
+            .unwrap();
 
         // Verify the encoding structure
         match &encoding.compression {
@@ -589,14 +691,16 @@ mod tests {
         let block_64 = DataBlock::from_array(array_64);
 
         let compressor_64 = GeneralMiniBlockCompressor::new(
-            Box::new(RleEncoder),
+            Box::new(RleEncoder::new()),
             CompressionConfig {
                 scheme: CompressionScheme::Lz4,
                 level: None,
             },
         );
 
-        let (_compressed_64, encoding_64) = compressor_64.compress(block_64).unwrap();
+        let (_compressed_64, encoding_64) = compressor_64
+            .compress(miniblock_context(), block_64)
+            .unwrap();
 
         // Verify the encoding structure for 64-bit
         match &encoding_64.compression {
@@ -650,7 +754,7 @@ mod tests {
             },
         );
 
-        let result = compressor.compress(empty_block);
+        let result = compressor.compress(miniblock_context(), empty_block);
         match result {
             Ok((compressed, _)) => {
                 assert_eq!(compressed.num_values, 0);

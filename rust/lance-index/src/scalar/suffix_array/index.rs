@@ -27,23 +27,22 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 use datafusion::execution::SendableRecordBatchStream;
-use deepsize::DeepSizeOf;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use lance_core::cache::{CacheKey, WeakLanceCache};
-use lance_core::utils::mask::RowAddrTreeMap;
+use lance_core::deepsize::DeepSizeOf;
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::{Error, Result};
+use lance_select::{NullableRowAddrSet, RowAddrTreeMap};
 use roaring::RoaringBitmap;
 use tracing::{info, warn};
 
-use crate::frag_reuse::FragReuseIndex;
 use crate::metrics::MetricsCollector;
 use crate::progress::NoopIndexBuildProgress;
-use crate::scalar::registry::{ScalarIndexPlugin, TrainingCriteria, TrainingOrdering};
+use crate::scalar::registry::{BasicTrainer, TrainingCriteria, TrainingOrdering};
 use crate::scalar::{
-    AnyQuery, CreatedIndex, IndexStore, OldIndexDataFilter, ScalarIndex, ScalarIndexParams,
-    SearchResult, UpdateCriteria,
+    AnyQuery, CreatedIndex, IndexStore, OldIndexDataFilter, RowIdRemapper, ScalarIndex,
+    ScalarIndexParams, SearchResult, UpdateCriteria,
 };
-use crate::vector::VectorIndex;
 use crate::{Index, IndexType};
 
 use super::bloom::BloomFilter;
@@ -107,7 +106,7 @@ pub struct SuffixArraySegment {
 }
 
 impl DeepSizeOf for SuffixArraySegment {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.tokenized.as_ref().map_or(0, |t| t.len())
             + self
                 .tokenized_cache
@@ -251,7 +250,7 @@ impl std::fmt::Debug for SuffixArrayIndex {
 }
 
 impl DeepSizeOf for SuffixArrayIndex {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
         // Count the metadata (always in memory) + bloom filters.
         // Segment data is in the cache and tracked there.
         self.segment_metas
@@ -275,12 +274,6 @@ impl Index for SuffixArrayIndex {
 
     fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
         self
-    }
-
-    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
-        Err(Error::invalid_input(
-            "SuffixArrayIndex is not a vector index",
-        ))
     }
 
     fn statistics(&self) -> Result<serde_json::Value> {
@@ -336,9 +329,10 @@ impl ScalarIndex for SuffixArrayIndex {
 
         let row_ids = self.search_rows(query_bytes, *max_results).await?;
         let map = RowAddrTreeMap::from_iter(row_ids);
-        Ok(SearchResult::Exact(
-            lance_core::utils::mask::NullableRowAddrSet::new(map, Default::default()),
-        ))
+        Ok(SearchResult::Exact(NullableRowAddrSet::new(
+            map,
+            Default::default(),
+        )))
     }
 
     fn can_remap(&self) -> bool {
@@ -347,7 +341,7 @@ impl ScalarIndex for SuffixArrayIndex {
 
     async fn remap(
         &self,
-        _mapping: &HashMap<u64, Option<u64>>,
+        _mapping: &RowAddrRemap,
         _dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
         Err(Error::not_supported(
@@ -471,7 +465,7 @@ impl SuffixArrayIndex {
     /// Load a single-segment SuffixArrayIndex lazily (v0 format).
     pub(crate) async fn load(
         store: Arc<dyn IndexStore>,
-        _frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        _frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &lance_core::cache::LanceCache,
         pointer_width: u8,
         total_entries: u64,
@@ -694,8 +688,10 @@ impl SuffixArrayIndex {
                     let offsets_bytes = offsets_col.value(0);
                     // Parse packed u64 values from little-endian bytes
                     offsets_bytes
-                        .chunks_exact(8)
-                        .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
+                        .as_chunks::<8>()
+                        .0
+                        .iter()
+                        .map(|chunk| u64::from_le_bytes(*chunk))
                         .collect()
                 }
                 Err(_) => Vec::new(), // File not found — legacy index
@@ -720,8 +716,10 @@ impl SuffixArrayIndex {
                         })?;
                     let row_ids_bytes = row_ids_col.value(0);
                     row_ids_bytes
-                        .chunks_exact(8)
-                        .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
+                        .as_chunks::<8>()
+                        .0
+                        .iter()
+                        .map(|chunk| u64::from_le_bytes(*chunk))
                         .collect()
                 }
                 Err(_) => Vec::new(), // File not found — legacy index
@@ -1362,7 +1360,7 @@ impl SuffixArrayIndex {
                 },
             })
             .collect();
-        distribution.sort_by(|a, b| b.count.cmp(&a.count));
+        distribution.sort_by_key(|e| Reverse(e.count));
 
         Ok(query::NtdResult {
             prompt_cnt: total_prompt_cnt,
@@ -1501,11 +1499,27 @@ impl IndexStore for NoopIndexStore {
         ))
     }
 
-    async fn copy_index_file(&self, _name: &str, _dest: &dyn IndexStore) -> Result<()> {
+    fn with_io_priority(&self, _io_priority: u64) -> Arc<dyn IndexStore> {
+        Arc::new(Self)
+    }
+
+    fn with_io_buffer_size(&self, _bytes: u64) -> Arc<dyn IndexStore> {
+        Arc::new(Self)
+    }
+
+    async fn copy_index_file(
+        &self,
+        _name: &str,
+        _dest: &dyn IndexStore,
+    ) -> Result<crate::scalar::IndexFile> {
         Err(Error::not_supported("NoopIndexStore: cannot copy files"))
     }
 
-    async fn rename_index_file(&self, _name: &str, _new_name: &str) -> Result<()> {
+    async fn rename_index_file(
+        &self,
+        _name: &str,
+        _new_name: &str,
+    ) -> Result<crate::scalar::IndexFile> {
         Err(Error::not_supported("NoopIndexStore: cannot rename files"))
     }
 

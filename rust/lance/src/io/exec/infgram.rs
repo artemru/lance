@@ -7,7 +7,6 @@
 //! suffix array index, resolves matching byte positions to row IDs via
 //! `doc_offsets`, and emits a two-column `RecordBatch` (row_id, _count).
 
-use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
@@ -93,10 +92,6 @@ impl DisplayAs for InfgramSearchExec {
 impl ExecutionPlan for InfgramSearchExec {
     fn name(&self) -> &str {
         "InfgramSearchExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn schema(&self) -> SchemaRef {
@@ -219,7 +214,7 @@ impl ExecutionPlan for InfgramSearchExec {
                 query_clauses.or_else(|| InfgramSearchQuery::parse_boolean_query(&query_text));
 
             for meta in &indices {
-                let uuid = meta.uuid.to_string();
+                let uuid = meta.uuid;
                 let index = ds
                     .open_generic_index(&column, &uuid, &NoOpMetricsCollector)
                     .await
@@ -318,7 +313,7 @@ impl ExecutionPlan for InfgramSearchExec {
             }
 
             // If we collected from multiple index versions, re-sort and take top-K
-            all_scored.sort_by(|a, b| b.1.cmp(&a.1));
+            all_scored.sort_by_key(|e| std::cmp::Reverse(e.1));
             all_scored.dedup_by_key(|item| item.0); // dedup by row_id, keep highest score (first)
             if let Some(lim) = limit {
                 all_scored.truncate(lim);

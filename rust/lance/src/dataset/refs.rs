@@ -8,7 +8,7 @@ use futures::stream::{StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_io::object_store::ObjectStore;
 use lance_table::io::commit::CommitHandler;
-use object_store::path::Path;
+use object_store::{Error as ObjectStoreError, path::Path};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -21,7 +21,6 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Formatter;
-use std::io::ErrorKind;
 use uuid::Uuid;
 
 pub const MAIN_BRANCH: &str = "main";
@@ -145,6 +144,25 @@ impl Branches<'_> {
     }
 }
 
+async fn put_ref_if_absent(
+    object_store: &ObjectStore,
+    path: &Path,
+    contents: Vec<u8>,
+    conflict_message: String,
+) -> Result<()> {
+    object_store
+        .put_if_absent(path, contents.into())
+        .await
+        .map_err(|error| match error {
+            ObjectStoreError::AlreadyExists { .. } | ObjectStoreError::Precondition { .. } => {
+                Error::RefConflict {
+                    message: conflict_message,
+                }
+            }
+            error => error.into(),
+        })
+}
+
 impl Tags<'_> {
     pub async fn fetch_tags(&self) -> Result<Vec<(String, TagContents)>> {
         let root_location = self.refs.root()?;
@@ -218,23 +236,18 @@ impl Tags<'_> {
         let root_location = self.refs.root()?;
         let tag_file = tag_path(&root_location.path, tag);
 
-        if self.object_store().exists(&tag_file).await? {
-            return Err(Error::RefConflict {
-                message: format!("tag {} already exists", tag),
-            });
-        }
         let now = utc_now();
         let tag_contents = self
             .build_tag_content_by_ref(reference, Some(now), Some(now))
             .await?;
 
-        self.object_store()
-            .put(
-                &tag_file,
-                serde_json::to_string_pretty(&tag_contents)?.as_bytes(),
-            )
-            .await
-            .map(|_| ())
+        put_ref_if_absent(
+            self.object_store(),
+            &tag_file,
+            serde_json::to_vec_pretty(&tag_contents)?,
+            format!("tag {} already exists", tag),
+        )
+        .await
     }
 
     pub async fn delete(&self, tag: &str) -> Result<()> {
@@ -326,6 +339,9 @@ impl Tags<'_> {
             }
         };
 
+        // Direct Ref::Version construction bypasses normalization in the tuple conversions.
+        let branch = branch.as_deref().and_then(standardize_branch);
+
         let branch_location = self.refs.base_location.find_branch(branch.as_deref())?;
         let manifest_file = if let Some(version_number) = version_number {
             self.refs
@@ -398,6 +414,7 @@ impl Branches<'_> {
                 let contents = BranchContents::from_path(
                     &branch_contents_path(branch_path, &name),
                     self.object_store(),
+                    &name,
                 )
                 .await?;
                 Ok((name, contents))
@@ -425,7 +442,8 @@ impl Branches<'_> {
             });
         }
 
-        let branch_contents = BranchContents::from_path(&branch_file, self.object_store()).await?;
+        let branch_contents =
+            BranchContents::from_path(&branch_file, self.object_store(), branch).await?;
 
         Ok(branch_contents)
     }
@@ -451,11 +469,6 @@ impl Branches<'_> {
         let source_branch = source_branch.and_then(standardize_branch);
         let root_location = self.refs.root()?;
         let branch_file = branch_contents_path(&root_location.path, branch_name);
-        if self.object_store().exists(&branch_file).await? {
-            return Err(Error::RefConflict {
-                message: format!("branch {} already exists", branch_name),
-            });
-        }
 
         let branch_location = self
             .refs
@@ -474,14 +487,14 @@ impl Branches<'_> {
 
         if !self.object_store().exists(&manifest_file.path).await? {
             return Err(Error::VersionNotFound {
-                message: format!("Manifest file {} does not exist", &manifest_file.path),
+                message: format!("Manifest file {} does not exist", manifest_file.path),
             });
         };
 
         let parent_branch_id = if let Some(ref parent_branch) = source_branch {
             let parent_file = branch_contents_path(&root_location.path, parent_branch);
             if self.object_store().exists(&parent_file).await? {
-                BranchContents::from_path(&parent_file, self.object_store())
+                BranchContents::from_path(&parent_file, self.object_store(), parent_branch)
                     .await?
                     .identifier
             } else {
@@ -506,13 +519,13 @@ impl Branches<'_> {
             metadata: HashMap::new(),
         };
 
-        self.object_store()
-            .put(
-                &branch_file,
-                serde_json::to_string_pretty(&branch_contents)?.as_bytes(),
-            )
-            .await
-            .map(|_| ())
+        put_ref_if_absent(
+            self.object_store(),
+            &branch_file,
+            serde_json::to_vec_pretty(&branch_contents)?,
+            format!("branch {} already exists", branch_name),
+        )
+        .await
     }
 
     pub async fn replace_metadata(
@@ -531,7 +544,7 @@ impl Branches<'_> {
         }
 
         let mut branch_contents =
-            BranchContents::from_path(&branch_file, self.object_store()).await?;
+            BranchContents::from_path(&branch_file, self.object_store(), branch).await?;
         branch_contents.metadata = metadata;
 
         self.object_store()
@@ -572,6 +585,28 @@ impl Branches<'_> {
             log::warn!("BranchContents of {} does not exist", branch);
         }
 
+        // Tags identify snapshots by (branch, version). Deleting a branch removes its entire version chain,
+        // so any tag whose branch matches the deletion target blocks the operation, regardless of the tagged
+        // version.
+        let referenced_tags = self
+            .refs
+            .tags()
+            .fetch_tags()
+            .await?
+            .into_iter()
+            .filter_map(|(name, contents)| {
+                (contents.branch.as_deref() == Some(branch)).then_some((name, contents.version))
+            })
+            .collect_vec();
+        if !referenced_tags.is_empty() {
+            return Err(Error::RefConflict {
+                message: format!(
+                    "Branch {} is referenced by tags {:?}, can not delete",
+                    branch, referenced_tags
+                ),
+            });
+        }
+
         let root_location = self.refs.root()?;
         let branch_file = branch_contents_path(&root_location.path, branch);
         if self.object_store().exists(&branch_file).await? {
@@ -609,16 +644,8 @@ impl Branches<'_> {
             && let Err(e) = self.refs.object_store.remove_dir_all(delete_path).await
         {
             match &e {
-                Error::IO { source, .. } => {
-                    if let Some(io_err) = source.downcast_ref::<std::io::Error>() {
-                        if io_err.kind() == ErrorKind::NotFound {
-                            log::debug!("Branch directory already deleted: {}", io_err);
-                        } else {
-                            return Err(e);
-                        }
-                    } else {
-                        return Err(e);
-                    }
+                Error::NotFound { .. } => {
+                    log::debug!("Branch directory already deleted");
                 }
                 _ => return Err(e),
             }
@@ -747,7 +774,7 @@ pub struct TagContents {
 #[serde(rename_all = "camelCase")]
 pub struct BranchContents {
     pub parent_branch: Option<String>,
-    #[serde(default = "BranchIdentifier::none")]
+    #[serde(default = "BranchIdentifier::missing_identifier_sentinel")]
     pub identifier: BranchIdentifier,
     pub parent_version: u64,
     pub create_at: u64, // unix timestamp
@@ -771,12 +798,58 @@ impl BranchIdentifier {
         Self { version_mapping }
     }
 
-    /// Creates a branch identifier for legacy branches without explicit lineage.
-    /// Legacy branches have parent_version=0 and are skipped during cleanup.
-    pub fn none() -> Self {
+    /// Creates a sentinel identifier for legacy branch metadata that lacks an explicit
+    /// identifier.
+    ///
+    /// `BranchContents::from_path` replaces this value with a deterministic synthetic
+    /// identifier. Keeping this sentinel stable lets us distinguish missing identifiers from
+    /// persisted identifiers without changing this field to `Option<BranchIdentifier>`.
+    pub fn missing_identifier_sentinel() -> Self {
         Self {
-            version_mapping: vec![(0, Uuid::new_v4().simple().to_string())],
+            version_mapping: vec![(0, Uuid::nil().simple().to_string())],
         }
+    }
+
+    fn synthetic_identifier(
+        branch_name: &str,
+        parent_branch: Option<&str>,
+        parent_version: u64,
+        create_at: u64,
+    ) -> Self {
+        let identifier_input = format!(
+            "branch_name={branch_name}\nparent_branch={}\nparent_version={parent_version}\ncreate_at={create_at}",
+            parent_branch.unwrap_or("")
+        );
+        Self {
+            version_mapping: vec![(
+                0,
+                Uuid::from_bytes(Self::synthetic_identifier_bytes(
+                    identifier_input.as_bytes(),
+                ))
+                .simple()
+                .to_string(),
+            )],
+        }
+    }
+
+    fn synthetic_identifier_bytes(input: &[u8]) -> [u8; 16] {
+        // Use fixed, local hashing so legacy fallback identifiers stay deterministic without
+        // enabling extra UUID generation features.
+        const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+        const FNV_PRIME: u64 = 0x100000001b3;
+
+        fn hash_with_seed(input: &[u8], seed: u64) -> u64 {
+            input.iter().fold(seed, |hash, byte| {
+                (hash ^ u64::from(*byte)).wrapping_mul(FNV_PRIME)
+            })
+        }
+
+        let first = hash_with_seed(input, FNV_OFFSET);
+        let second = hash_with_seed(input, FNV_OFFSET ^ 0x9e3779b97f4a7c15);
+        let mut bytes = [0; 16];
+        bytes[..8].copy_from_slice(&first.to_be_bytes());
+        bytes[8..].copy_from_slice(&second.to_be_bytes());
+        bytes
     }
 
     pub fn main() -> Self {
@@ -797,7 +870,9 @@ impl BranchIdentifier {
         }
 
         let version_mapping = parts
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|chunk| {
                 let version = chunk[0].parse::<u64>().map_err(|e| Error::InvalidRef {
                     message: format!("Invalid version number '{}': {}", chunk[0], e),
@@ -896,8 +971,24 @@ impl TagContents {
 }
 
 impl BranchContents {
-    pub async fn from_path(path: &Path, object_store: &ObjectStore) -> Result<Self> {
-        from_path(path, object_store).await
+    pub async fn from_path(
+        path: &Path,
+        object_store: &ObjectStore,
+        branch_name: &str,
+    ) -> Result<Self> {
+        let mut contents: Self = from_path(path, object_store).await?;
+        if contents.identifier == BranchIdentifier::missing_identifier_sentinel() {
+            // Legacy branch files do not store an identifier. Derive a deterministic fallback
+            // from stable branch metadata so repeated reads expose the same public
+            // branch_identifier.
+            contents.identifier = BranchIdentifier::synthetic_identifier(
+                branch_name,
+                contents.parent_branch.as_deref(),
+                contents.parent_version,
+                contents.create_at,
+            );
+        }
+        Ok(contents)
     }
 }
 
@@ -956,7 +1047,8 @@ pub fn check_valid_branch(branch_name: &str) -> Result<()> {
 
     if branch_name.eq("main") {
         return Err(Error::InvalidRef {
-            message: "Branch name cannot be 'main'".to_string(),
+            message: "\"main\" is reserved for the default branch; use a different branch name"
+                .to_string(),
         });
     }
     Ok(())
@@ -1160,7 +1252,7 @@ mod tests {
     async fn test_branch_contents_serialization() {
         let branch_contents = BranchContents {
             parent_branch: Some("main".to_string()),
-            identifier: BranchIdentifier::none(),
+            identifier: BranchIdentifier::missing_identifier_sentinel(),
             parent_version: 42,
             create_at: 1234567890,
             manifest_size: 1024,
@@ -1187,6 +1279,47 @@ mod tests {
         let legacy_json = r#"{"parentBranch":"main","parentVersion":42,"createAt":1234567890,"manifestSize":1024}"#;
         let legacy_deserialized: BranchContents = serde_json::from_str(legacy_json).unwrap();
         assert!(legacy_deserialized.metadata.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_branch_synthetic_uuid_is_stable() {
+        let legacy_json = r#"{"parentBranch":"main","parentVersion":42,"createAt":1234567890,"manifestSize":1024}"#;
+        let store = ObjectStore::memory();
+        let base_path = Path::from("dataset");
+        let first_path = branch_contents_path(&base_path, "legacy_branch");
+        store
+            .put(&first_path, legacy_json.as_bytes())
+            .await
+            .unwrap();
+        let second_path = branch_contents_path(&base_path, "legacy_branch_other");
+        store
+            .put(&second_path, legacy_json.as_bytes())
+            .await
+            .unwrap();
+
+        let first = BranchContents::from_path(&first_path, &store, "legacy_branch")
+            .await
+            .unwrap();
+        let second = BranchContents::from_path(&first_path, &store, "legacy_branch")
+            .await
+            .unwrap();
+        assert_eq!(first.identifier, second.identifier);
+        assert_ne!(
+            first.identifier,
+            BranchIdentifier::missing_identifier_sentinel()
+        );
+        assert_eq!(first.identifier.version_mapping[0].1.len(), 32);
+        assert!(
+            first.identifier.version_mapping[0]
+                .1
+                .chars()
+                .all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase())
+        );
+
+        let other = BranchContents::from_path(&second_path, &store, "legacy_branch_other")
+            .await
+            .unwrap();
+        assert_ne!(first.identifier, other.identifier);
     }
 
     #[tokio::test]

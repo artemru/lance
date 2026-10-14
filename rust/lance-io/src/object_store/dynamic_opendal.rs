@@ -3,8 +3,10 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::ops::Range;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt, stream, stream::BoxStream};
 use object_store::path::Path;
 use object_store::{
@@ -12,10 +14,10 @@ use object_store::{
     ObjectStore as OSObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
     RenameOptions,
 };
-use object_store_opendal::OpendalStore;
 use tokio::sync::RwLock;
 
 use crate::object_store::StorageOptionsAccessor;
+use crate::object_store::opendal_store::OpendalStore;
 use lance_core::Result;
 
 type NormalizeConfigFn = fn(&HashMap<String, String>) -> Result<HashMap<String, String>>;
@@ -170,6 +172,18 @@ impl OSObjectStore for DynamicOpenDalStore {
             .await
     }
 
+    async fn get_ranges(
+        &self,
+        location: &Path,
+        ranges: &[Range<u64>],
+    ) -> object_store::Result<Vec<Bytes>> {
+        self.current_store()
+            .await
+            .map_err(|e| self.map_store_error(e))?
+            .get_ranges(location, ranges)
+            .await
+    }
+
     fn delete_stream(
         &self,
         locations: BoxStream<'static, object_store::Result<Path>>,
@@ -264,7 +278,7 @@ mod tests {
                         "Failed to create memory operator: {e:?}"
                     ))
                 })?;
-                Ok(OpendalStore::new(operator.finish()))
+                Ok(OpendalStore::new(operator))
             },
         );
 
@@ -302,7 +316,7 @@ mod tests {
                         "Failed to create memory operator: {e:?}"
                     ))
                 })?;
-                Ok(OpendalStore::new(operator.finish()))
+                Ok(OpendalStore::new(operator))
             },
         )
         .with_protected_keys(["bucket", "root"]);

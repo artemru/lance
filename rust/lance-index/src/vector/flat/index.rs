@@ -4,26 +4,29 @@
 //! Flat Vector Index.
 //!
 
-use std::collections::{BinaryHeap, HashMap};
+use lance_core::utils::row_addr_remap::RowAddrRemap;
+use std::collections::BinaryHeap;
 use std::sync::Arc;
 
 use arrow::array::AsArray;
 use arrow_array::{Array, ArrayRef, Float32Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use deepsize::DeepSizeOf;
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, ROW_ID_FIELD, Result};
-use lance_file::previous::reader::FileReader as PreviousFileReader;
+use lance_file::versions::v1::reader::FileReader as V1FileReader;
 use lance_linalg::distance::DistanceType;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    metrics::MetricsCollector,
+    metrics::{IndexTimer, IndexTiming, MetricsCollector},
     prefilter::PreFilter,
     vector::{
-        DIST_COL, Query,
+        ApproxMode, DIST_COL, Query,
         graph::{OrderedFloat, OrderedNode},
         quantizer::{Quantization, QuantizationType, Quantizer, QuantizerMetadata},
-        storage::{DistCalculator, VectorStore},
+        storage::{
+            DistCalculator, DistanceCalculatorOptions, QueryResidual, QueryScratch, VectorStore,
+        },
         v3::subindex::IvfSubIndex,
     },
 };
@@ -48,29 +51,6 @@ fn push_candidate_local(
     }
 }
 
-#[inline(always)]
-fn push_candidate_global(
-    res: &mut BinaryHeap<OrderedNode<u64>>,
-    k: usize,
-    row_id: u64,
-    dist: OrderedFloat,
-    max_dist: &mut Option<OrderedFloat>,
-) {
-    if k == 0 {
-        return;
-    }
-    if res.len() < k {
-        res.push(OrderedNode::new(row_id, dist));
-        if res.len() == k {
-            *max_dist = res.peek().map(|node| node.dist);
-        }
-    } else if max_dist.is_some_and(|max_dist| max_dist > dist) {
-        res.pop();
-        res.push(OrderedNode::new(row_id, dist));
-        *max_dist = res.peek().map(|node| node.dist);
-    }
-}
-
 /// A Flat index is any index that stores no metadata, and
 /// during query, it simply scans over the storage and returns the top k results
 #[derive(Debug, Clone, Default, DeepSizeOf)]
@@ -86,11 +66,27 @@ static ANN_SEARCH_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     .into()
 });
 
+/// A partition goes through the screened top-k scan only when it has more
+/// than this many rows per result. Screening computes a quantized sum for every
+/// row and then rescores its candidates exactly, in SIMD chunks of 16; with few
+/// rows per result most rows end up rescored, so the quantization and sums
+/// cost more than the scoring they skip. With 4-bit PQ at m=96 it lost to the
+/// bulk scan at 2.5 rows per result on x86 (won on Graviton3), and won on both
+/// at 5. Those ratios were measured when this routing was added, before later
+/// changes to candidate selection and the kernels, and have not been re-tuned.
+const MIN_ROWS_PER_RESULT_FOR_TOPK_SCAN: usize = 4;
+
+/// Marker schema for the flat index, which stores no data of its own.
+static FLAT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Schema::new(vec![Field::new("__flat_marker", DataType::UInt64, false)]).into()
+});
+
 #[derive(Default)]
 pub struct FlatQueryParams {
     lower_bound: Option<f32>,
     upper_bound: Option<f32>,
     dist_q_c: f32,
+    approx_mode: ApproxMode,
 }
 
 impl From<&Query> for FlatQueryParams {
@@ -99,6 +95,7 @@ impl From<&Query> for FlatQueryParams {
             lower_bound: q.lower_bound,
             upper_bound: q.upper_bound,
             dist_q_c: q.dist_q_c,
+            approx_mode: q.approx_mode,
         }
     }
 }
@@ -116,7 +113,7 @@ impl IvfSubIndex for FlatIndex {
     }
 
     fn schema() -> arrow_schema::SchemaRef {
-        Schema::new(vec![Field::new("__flat_marker", DataType::UInt64, false)]).into()
+        FLAT_SCHEMA.clone()
     }
 
     fn search(
@@ -128,15 +125,75 @@ impl IvfSubIndex for FlatIndex {
         prefilter: Arc<dyn PreFilter>,
         metrics: &dyn MetricsCollector,
     ) -> Result<RecordBatch> {
+        let mut scratch = QueryScratch::new();
+        self.search_with_scratch(
+            query,
+            k,
+            params,
+            storage,
+            prefilter,
+            metrics,
+            None,
+            &mut scratch,
+        )
+    }
+
+    fn search_with_scratch(
+        &self,
+        query: ArrayRef,
+        k: usize,
+        params: Self::QueryParams,
+        storage: &impl VectorStore,
+        prefilter: Arc<dyn PreFilter>,
+        metrics: &dyn MetricsCollector,
+        residual: Option<QueryResidual<'_>>,
+        scratch: &mut QueryScratch,
+    ) -> Result<RecordBatch> {
         let is_range_query = params.lower_bound.is_some() || params.upper_bound.is_some();
         let row_ids = storage.row_ids();
-        let dist_calc = storage.dist_calculator(query, params.dist_q_c);
+        let query_timer = IndexTimer::new(metrics, IndexTiming::QueryPrepare);
+        let dist_calc = storage.dist_calculator_with_scratch(
+            query,
+            params.dist_q_c,
+            residual,
+            &mut scratch.query_f32,
+            DistanceCalculatorOptions {
+                approx_mode: params.approx_mode,
+            },
+        );
+        drop(query_timer);
         let mut res = BinaryHeap::with_capacity(k);
         metrics.record_comparisons(storage.len());
+        // Filtering, distance evaluation and heap updates are fused in fast-scan paths.
+        let distance_timer = IndexTimer::new(metrics, IndexTiming::DistanceTopK);
 
         match prefilter.is_empty() {
+            // The calculator certifies that its top-k scan keeps every row the
+            // push below would, so it can skip scoring most rows.
+            true if storage.len() > k.saturating_mul(MIN_ROWS_PER_RESULT_FOR_TOPK_SCAN)
+                && dist_calc.has_exact_topk_scan() =>
+            {
+                dist_calc.accumulate_topk_with_scratch(
+                    k,
+                    params.lower_bound,
+                    params.upper_bound,
+                    |id| storage.row_id(id),
+                    &mut res,
+                    &mut scratch.distances,
+                    &mut scratch.u16,
+                    &mut scratch.u8,
+                    &mut scratch.u32,
+                );
+            }
             true => {
-                let dists = dist_calc.distance_all(k);
+                dist_calc.distance_all_with_scratch(
+                    k,
+                    &mut scratch.distances,
+                    &mut scratch.u16,
+                    &mut scratch.u8,
+                    &mut scratch.u32,
+                );
+                let dists = scratch.distances.iter().copied();
 
                 if is_range_query {
                     let lower_bound = params.lower_bound.unwrap_or(f32::MIN).into();
@@ -185,6 +242,8 @@ impl IvfSubIndex for FlatIndex {
             }
         };
 
+        drop(distance_timer);
+        let _result_timer = IndexTimer::new(metrics, IndexTiming::ResultMaterialize);
         // we don't need to sort the results by distances here
         // because there's a SortExec node in the query plan which sorts the results from all partitions
         let (row_ids, dists): (Vec<_>, Vec<_>) = res.into_iter().map(|r| (r.id, r.dist.0)).unzip();
@@ -210,9 +269,7 @@ impl IvfSubIndex for FlatIndex {
         res: &mut BinaryHeap<OrderedNode<u64>>,
         metrics: &dyn MetricsCollector,
     ) -> Result<()> {
-        let mut distance_scratch = Vec::new();
-        let mut u16_scratch = Vec::new();
-        let mut u8_scratch = Vec::new();
+        let mut scratch = QueryScratch::new();
         self.accumulate_topk_with_scratch(
             query,
             k,
@@ -220,9 +277,8 @@ impl IvfSubIndex for FlatIndex {
             storage,
             prefilter,
             res,
-            &mut distance_scratch,
-            &mut u16_scratch,
-            &mut u8_scratch,
+            None,
+            &mut scratch,
             metrics,
         )
     }
@@ -235,67 +291,57 @@ impl IvfSubIndex for FlatIndex {
         storage: &impl VectorStore,
         prefilter: Arc<dyn PreFilter>,
         res: &mut BinaryHeap<OrderedNode<u64>>,
-        distance_scratch: &mut Vec<f32>,
-        u16_scratch: &mut Vec<u16>,
-        u8_scratch: &mut Vec<u8>,
+        residual: Option<QueryResidual<'_>>,
+        scratch: &mut QueryScratch,
         metrics: &dyn MetricsCollector,
     ) -> Result<()> {
-        let is_range_query = params.lower_bound.is_some() || params.upper_bound.is_some();
         let row_ids = storage.row_ids();
-        let dist_calc = storage.dist_calculator(query, params.dist_q_c);
-        let mut max_dist = res.peek().map(|node| node.dist);
+        let query_timer = IndexTimer::new(metrics, IndexTiming::QueryPrepare);
+        let dist_calc = storage.dist_calculator_with_scratch(
+            query,
+            params.dist_q_c,
+            residual,
+            &mut scratch.query_f32,
+            DistanceCalculatorOptions {
+                approx_mode: params.approx_mode,
+            },
+        );
+        drop(query_timer);
         metrics.record_comparisons(storage.len());
+        // Filtering, distance evaluation and heap updates are fused in fast-scan paths.
+        let distance_timer = IndexTimer::new(metrics, IndexTiming::DistanceTopK);
 
         match prefilter.is_empty() {
             true => {
-                dist_calc.distance_all_with_scratch(k, distance_scratch, u16_scratch, u8_scratch);
-                let dists = distance_scratch.iter().copied();
-
-                if is_range_query {
-                    let lower_bound = params.lower_bound.unwrap_or(f32::MIN).into();
-                    let upper_bound = params.upper_bound.unwrap_or(f32::MAX).into();
-
-                    for (&row_id, dist) in row_ids.zip(dists) {
-                        let dist = dist.into();
-                        if dist < lower_bound || dist >= upper_bound {
-                            continue;
-                        }
-                        push_candidate_global(res, k, row_id, dist, &mut max_dist);
-                    }
-                } else {
-                    for (&row_id, dist) in row_ids.zip(dists) {
-                        let dist = dist.into();
-                        push_candidate_global(res, k, row_id, dist, &mut max_dist);
-                    }
-                }
+                dist_calc.accumulate_topk_with_scratch(
+                    k,
+                    params.lower_bound,
+                    params.upper_bound,
+                    |id| storage.row_id(id),
+                    res,
+                    &mut scratch.distances,
+                    &mut scratch.u16,
+                    &mut scratch.u8,
+                    &mut scratch.u32,
+                );
             }
             false => {
                 let row_addr_mask = prefilter.mask();
-                if is_range_query {
-                    let lower_bound = params.lower_bound.unwrap_or(f32::MIN).into();
-                    let upper_bound = params.upper_bound.unwrap_or(f32::MAX).into();
-                    for (id, &row_addr) in row_ids.enumerate() {
-                        if !row_addr_mask.selected(row_addr) {
-                            continue;
-                        }
-                        let dist = dist_calc.distance(id as u32).into();
-                        if dist < lower_bound || dist >= upper_bound {
-                            continue;
-                        }
-
-                        push_candidate_global(res, k, row_addr, dist, &mut max_dist);
-                    }
-                } else {
-                    for (id, &row_addr) in row_ids.enumerate() {
-                        if !row_addr_mask.selected(row_addr) {
-                            continue;
-                        }
-                        let dist = dist_calc.distance(id as u32).into();
-                        push_candidate_global(res, k, row_addr, dist, &mut max_dist);
-                    }
-                }
+                dist_calc.accumulate_filtered_topk_with_scratch(
+                    k,
+                    params.lower_bound,
+                    params.upper_bound,
+                    row_ids.enumerate().map(|(id, &row_id)| (id as u32, row_id)),
+                    |row_id| row_addr_mask.selected(row_id),
+                    res,
+                    &mut scratch.distances,
+                    &mut scratch.u16,
+                    &mut scratch.u8,
+                    &mut scratch.u32,
+                );
             }
         };
+        drop(distance_timer);
         Ok(())
     }
 
@@ -310,7 +356,7 @@ impl IvfSubIndex for FlatIndex {
         Ok(Self {})
     }
 
-    fn remap(&self, _: &HashMap<u64, Option<u64>>, _: &impl VectorStore) -> Result<Self> {
+    fn remap(&self, _: &RowAddrRemap, _: &impl VectorStore) -> Result<Self> {
         Ok(self.clone())
     }
 
@@ -326,7 +372,7 @@ pub struct FlatMetadata {
 
 #[async_trait::async_trait]
 impl QuantizerMetadata for FlatMetadata {
-    async fn load(_: &PreviousFileReader) -> Result<Self> {
+    async fn load(_: &V1FileReader) -> Result<Self> {
         unimplemented!("Flat will be used in new index builder which doesn't require this")
     }
 }
@@ -510,10 +556,19 @@ mod tests {
     use arrow_array::FixedSizeListArray;
     use async_trait::async_trait;
     use lance_arrow::FixedSizeListArrayExt;
-    use lance_core::utils::mask::{RowAddrMask, RowAddrTreeMap};
+    use lance_select::{RowAddrMask, RowAddrTreeMap};
 
     use crate::metrics::NoOpMetricsCollector;
     use crate::prefilter::NoFilter;
+
+    #[test]
+    fn test_schema_is_initialized_once() {
+        // The subindex schema is requested per call, so it is shared rather
+        // than rebuilt. Pointer equality is what distinguishes a shared schema
+        // from an equal-but-freshly-allocated one.
+        assert!(Arc::ptr_eq(&FlatIndex::schema(), &FlatIndex::schema()));
+        assert_eq!(FlatIndex::schema().field(0).name(), "__flat_marker");
+    }
 
     struct MaskPreFilter {
         mask: Arc<RowAddrMask>,
@@ -567,7 +622,7 @@ mod tests {
             .zip(dists.values().iter())
             .map(|(row_id, dist)| (*row_id, *dist))
             .collect::<Vec<_>>();
-        results.sort_by(|left, right| left.0.cmp(&right.0));
+        results.sort_by_key(|left| left.0);
         results
     }
 
@@ -576,7 +631,7 @@ mod tests {
             .into_iter()
             .map(|node| (node.id, node.dist.0))
             .collect::<Vec<_>>();
-        results.sort_by(|left, right| left.0.cmp(&right.0));
+        results.sort_by_key(|left| left.0);
         results
     }
 

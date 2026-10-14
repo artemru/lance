@@ -3,16 +3,18 @@
 
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
+use crate::index_progress::JavaIndexBuildProgress;
 use crate::namespace::{
     BlockingDirectoryNamespace, BlockingRestNamespace, create_java_lance_namespace,
 };
 use crate::session::{handle_from_session, session_from_handle};
 use crate::traits::{FromJObjectWithEnv, FromJString, export_vec, import_vec, import_vec_to_rust};
 use crate::utils::{
-    build_compaction_options, extract_storage_options, extract_write_params,
-    get_scalar_index_params, get_vector_index_params, to_java_map, to_rust_map,
+    build_compaction_options, extract_base_store_params, extract_storage_options,
+    extract_write_params, get_scalar_index_params, get_vector_index_params, to_java_map,
+    to_rust_map,
 };
-use crate::{RT, traits::IntoJava};
+use crate::{block_on, traits::IntoJava};
 use arrow::array::RecordBatchReader;
 use arrow::datatypes::Schema;
 use arrow::ffi::FFI_ArrowSchema;
@@ -20,7 +22,6 @@ use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::ffi_stream::FFI_ArrowArrayStream;
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatchIterator;
-use arrow_schema::DataType;
 use arrow_schema::Schema as ArrowSchema;
 use chrono::{DateTime, Utc};
 use jni::objects::{JMap, JString, JValue};
@@ -28,7 +29,10 @@ use jni::sys::{jboolean, jint};
 use jni::sys::{jbyteArray, jlong};
 use jni::{JNIEnv, objects::JObject};
 use lance::dataset::builder::DatasetBuilder;
-use lance::dataset::cleanup::{CleanupPolicy, RemovalStats};
+use lance::dataset::cleanup::{
+    CleanupCandidateFile, CleanupExplanation, CleanupFileKind, CleanupPolicy,
+    CleanupReferencedBranch, RemovalStats,
+};
 use lance::dataset::optimize::{CompactionOptions as RustCompactionOptions, compact_files};
 use lance::dataset::refs::{Ref, TagContents};
 use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt};
@@ -37,36 +41,39 @@ use lance::dataset::{
     ColumnAlteration, CommitBuilder, Dataset, NewColumnTransform, ProjectionRequest, ReadParams,
     Version, WriteParams,
 };
-use lance::index::{DatasetIndexExt, IndexSegment};
+use lance::index::{DatasetIndexExt, IndexSegment, IntoIndexSegment};
 use lance::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 use lance::io::{ObjectStore, ObjectStoreParams};
 use lance::session::Session as LanceSession;
 use lance::table::format::IndexMetadata;
-use lance::table::format::{BasePath, Fragment};
+use lance::table::format::{BasePath, Fragment, WriterVersion};
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_file::version::LanceFileVersion;
 use lance_index::IndexCriteria as RustIndexCriteria;
 use lance_index::optimize::OptimizeOptions;
-use lance_index::progress::noop_progress;
-use lance_index::scalar::btree::BTreeParameters;
+use lance_index::progress::{IndexBuildProgress, noop_progress};
 use lance_index::{IndexParams, IndexType};
 use lance_io::object_store::ObjectStoreRegistry;
 use lance_io::object_store::{LanceNamespaceStorageOptionsProvider, StorageOptionsProvider};
 use lance_namespace::LanceNamespace;
 use lance_table::io::commit::CommitHandler;
 use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
-use std::collections::HashMap;
+use lance_table::io::commit::{ManifestLocation, ManifestNamingScheme};
+use std::collections::{HashMap, HashSet};
 use std::future::IntoFuture;
 use std::iter::empty;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
+use uuid::Uuid;
 
 pub const NATIVE_DATASET: &str = "nativeDatasetHandle";
 
 impl FromJObjectWithEnv<BasePath> for JObject<'_> {
     fn extract_object(&self, env: &mut JNIEnv<'_>) -> Result<BasePath> {
-        let id = env.get_u32_from_method(self, "getId")?;
+        let java_id = env.call_method(self, "getId", "()I", &[])?.i()?;
+        let id = u32::try_from(java_id).map_err(|_| {
+            Error::input_error(format!("BasePath.id must be non-negative, got {java_id}"))
+        })?;
         let name = env.get_optional_string_from_method(self, "getName")?;
         let path = env.get_string_from_method(self, "getPath")?;
         let is_dataset_root = env.get_boolean_from_method(self, "isDatasetRoot")?;
@@ -76,6 +83,37 @@ impl FromJObjectWithEnv<BasePath> for JObject<'_> {
             path,
             is_dataset_root,
         })
+    }
+}
+
+impl IntoJava for &BasePath {
+    fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
+        let id = i32::try_from(self.id).map_err(|_| {
+            Error::runtime_error(format!("Base path id {} exceeds Java int range", self.id))
+        })?;
+        let name = match self.name.as_ref() {
+            Some(name) => env.new_string(name)?.into(),
+            None => JObject::null(),
+        };
+        let name = env
+            .call_static_method(
+                "java/util/Optional",
+                "ofNullable",
+                "(Ljava/lang/Object;)Ljava/util/Optional;",
+                &[JValue::Object(&name)],
+            )?
+            .l()?;
+        let path = env.new_string(&self.path)?;
+        Ok(env.new_object(
+            "org/lance/BasePath",
+            "(ILjava/util/Optional;Ljava/lang/String;Z)V",
+            &[
+                JValue::Int(id),
+                JValue::Object(&name),
+                JValue::Object(&path),
+                JValue::Bool(self.is_dataset_root.into()),
+            ],
+        )?)
     }
 }
 
@@ -99,13 +137,13 @@ impl BlockingDataset {
     /// If a storage options provider was configured and credentials are expiring,
     /// this will refresh them.
     pub fn latest_storage_options(&self) -> Result<Option<HashMap<String, String>>> {
-        RT.block_on(async { self.inner.latest_storage_options().await })
+        block_on(async { self.inner.latest_storage_options().await })
             .map(|opt| opt.map(|opts| opts.0))
             .map_err(|e| Error::io_error(e.to_string()))
     }
 
     pub fn drop(uri: &str, storage_options: HashMap<String, String>) -> Result<()> {
-        RT.block_on(async move {
+        block_on(async move {
             let registry = Arc::new(ObjectStoreRegistry::default());
             let object_store_params = ObjectStoreParams {
                 storage_options_accessor: Some(Arc::new(
@@ -117,18 +155,45 @@ impl BlockingDataset {
                 ObjectStore::from_uri_and_params(registry, uri, &object_store_params)
                     .await
                     .map_err(|e| Error::io_error(e.to_string()))?;
+            lance::dataset::validate_dataset_root_for_drop(&object_store, &path)
+                .await
+                .map_err(|e| Error::input_error(e.to_string()))?;
             object_store
                 .remove_dir_all(path)
                 .await
                 .map_err(|e| Error::io_error(e.to_string()))
         })
     }
+
+    pub fn list_manifest_locations(
+        uri: &str,
+        storage_options: HashMap<String, String>,
+    ) -> Result<Vec<ManifestLocation>> {
+        let accessor = (!storage_options.is_empty()).then(|| {
+            Arc::new(lance::io::StorageOptionsAccessor::with_static_options(
+                storage_options,
+            ))
+        });
+        let params = ReadParams {
+            store_options: Some(ObjectStoreParams {
+                storage_options_accessor: accessor,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        Ok(block_on(
+            DatasetBuilder::from_uri(uri)
+                .with_read_params(params)
+                .list_manifest_locations(),
+        )?)
+    }
+
     pub fn write(
         reader: impl RecordBatchReader + Send + 'static,
         uri: &str,
         params: Option<WriteParams>,
     ) -> Result<Self> {
-        let inner = RT.block_on(Dataset::write(reader, uri, params))?;
+        let inner = block_on(Dataset::write(reader, uri, params))?;
         Ok(Self { inner })
     }
 
@@ -139,11 +204,12 @@ impl BlockingDataset {
     #[allow(clippy::too_many_arguments)]
     pub fn open(
         uri: &str,
-        version: Option<u64>,
+        reference: Option<Ref>,
         block_size: Option<i32>,
         index_cache_size_bytes: i64,
         metadata_cache_size_bytes: i64,
         storage_options: HashMap<String, String>,
+        base_store_params: HashMap<String, ObjectStoreParams>,
         serialized_manifest: Option<&[u8]>,
         storage_options_provider: Option<Arc<dyn StorageOptionsProvider>>,
         session: Option<Arc<LanceSession>>,
@@ -183,9 +249,18 @@ impl BlockingDataset {
 
         let mut builder = DatasetBuilder::from_uri(uri).with_read_params(params);
 
-        if let Some(ver) = version {
-            builder = builder.with_version(ver);
+        for (base_path, store_params) in base_store_params {
+            builder = builder.with_base_store_params(base_path, store_params);
         }
+
+        builder = match reference {
+            Some(Ref::VersionNumber(version)) | Some(Ref::Version(None, Some(version))) => {
+                builder.with_version(version)
+            }
+            Some(Ref::Version(Some(branch), version)) => builder.with_branch(&branch, version),
+            Some(Ref::Tag(tag)) => builder.with_tag(&tag),
+            Some(Ref::Version(None, None)) | None => builder,
+        };
 
         if let Some(serialized_manifest) = serialized_manifest {
             builder = builder.with_serialized_manifest(serialized_manifest)?;
@@ -195,14 +270,15 @@ impl BlockingDataset {
         if namespace_client_managed_versioning
             && let (Some(namespace_client), Some(tid)) = (namespace, table_id)
         {
-            let external_store = LanceNamespaceExternalManifestStore::new(namespace_client, tid);
+            let external_store =
+                LanceNamespaceExternalManifestStore::for_table_uri(namespace_client, tid, uri)?;
             let commit_handler: Arc<dyn CommitHandler> = Arc::new(ExternalManifestCommitHandler {
                 external_manifest_store: Arc::new(external_store),
             });
             builder = builder.with_commit_handler(commit_handler);
         }
 
-        let inner = RT.block_on(builder.load())?;
+        let inner = block_on(builder.load())?;
         Ok(Self { inner })
     }
 
@@ -219,7 +295,7 @@ impl BlockingDataset {
                 lance::io::StorageOptionsAccessor::with_static_options(storage_options),
             ))
         };
-        let inner = RT.block_on(Dataset::commit(
+        let inner = block_on(Dataset::commit(
             uri,
             operation,
             read_version,
@@ -235,13 +311,17 @@ impl BlockingDataset {
     }
 
     pub fn latest_version(&self) -> Result<u64> {
-        let version = RT.block_on(self.inner.latest_version_id())?;
+        let version = block_on(self.inner.latest_version_id())?;
         Ok(version)
     }
 
     pub fn list_versions(&self) -> Result<Vec<Version>> {
-        let versions = RT.block_on(self.inner.versions())?;
+        let versions = block_on(self.inner.versions())?;
         Ok(versions)
+    }
+
+    pub fn count_versions(&self) -> Result<u64> {
+        Ok(block_on(self.inner.count_versions())?)
     }
 
     pub fn version(&self) -> Result<Version> {
@@ -249,37 +329,37 @@ impl BlockingDataset {
     }
 
     pub fn checkout_version(&mut self, version: u64) -> Result<Self> {
-        let inner = RT.block_on(self.inner.checkout_version(version))?;
+        let inner = block_on(self.inner.checkout_version(version))?;
         Ok(Self { inner })
     }
 
     pub fn checkout_tag(&mut self, tag: &str) -> Result<Self> {
-        let inner = RT.block_on(self.inner.checkout_version(tag))?;
+        let inner = block_on(self.inner.checkout_version(tag))?;
         Ok(Self { inner })
     }
 
     pub fn checkout_latest(&mut self) -> Result<()> {
-        RT.block_on(self.inner.checkout_latest())?;
+        block_on(self.inner.checkout_latest())?;
         Ok(())
     }
 
     pub fn restore(&mut self) -> Result<()> {
-        RT.block_on(self.inner.restore())?;
+        block_on(self.inner.restore())?;
         Ok(())
     }
 
     pub fn list_tags(&self) -> Result<HashMap<String, TagContents>> {
-        let tags = RT.block_on(self.inner.tags().list())?;
+        let tags = block_on(self.inner.tags().list())?;
         Ok(tags)
     }
 
     pub fn list_branches(&self) -> Result<HashMap<String, lance::dataset::refs::BranchContents>> {
-        let branches = RT.block_on(self.inner.branches().list())?;
+        let branches = block_on(self.inner.branches().list())?;
         Ok(branches)
     }
 
     pub fn delete_branch(&mut self, branch: &str) -> Result<()> {
-        RT.block_on(self.inner.branches().delete(branch, true))?;
+        block_on(self.inner.branches().delete(branch, true))?;
         Ok(())
     }
 
@@ -294,22 +374,22 @@ impl BlockingDataset {
         } else {
             Ref::Version(branch, version)
         };
-        let inner = RT.block_on(self.inner.checkout_version(reference))?;
+        let inner = block_on(self.inner.checkout_version(reference))?;
         Ok(Self { inner })
     }
 
     pub fn create_tag(&mut self, tag: &str, reference: Ref) -> Result<()> {
-        RT.block_on(self.inner.tags().create(tag, reference))?;
+        block_on(self.inner.tags().create(tag, reference))?;
         Ok(())
     }
 
     pub fn delete_tag(&mut self, tag: &str) -> Result<()> {
-        RT.block_on(self.inner.tags().delete(tag))?;
+        block_on(self.inner.tags().delete(tag))?;
         Ok(())
     }
 
     pub fn update_tag(&mut self, tag: &str, reference: Ref) -> Result<()> {
-        RT.block_on(self.inner.tags().update(tag, reference))?;
+        block_on(self.inner.tags().update(tag, reference))?;
         Ok(())
     }
 
@@ -318,7 +398,7 @@ impl BlockingDataset {
         tag: &str,
         metadata: HashMap<String, String>,
     ) -> Result<()> {
-        RT.block_on(self.inner.tags().replace_metadata(tag, metadata))?;
+        block_on(self.inner.tags().replace_metadata(tag, metadata))?;
         Ok(())
     }
 
@@ -327,27 +407,27 @@ impl BlockingDataset {
         branch: &str,
         metadata: HashMap<String, String>,
     ) -> Result<()> {
-        RT.block_on(self.inner.branches().replace_metadata(branch, metadata))?;
+        block_on(self.inner.branches().replace_metadata(branch, metadata))?;
         Ok(())
     }
 
     pub fn get_version(&self, tag: &str) -> Result<u64> {
-        let version = RT.block_on(self.inner.tags().get_version(tag))?;
+        let version = block_on(self.inner.tags().get_version(tag))?;
         Ok(version)
     }
 
     pub fn count_rows(&self, filter: Option<String>) -> Result<usize> {
-        let rows = RT.block_on(self.inner.count_rows(filter))?;
+        let rows = block_on(self.inner.count_rows(filter))?;
         Ok(rows)
     }
 
     pub fn calculate_data_stats(&self) -> Result<DataStatistics> {
-        let stats = RT.block_on(Arc::new(self.clone().inner).calculate_data_stats())?;
+        let stats = block_on(Arc::new(self.clone().inner).calculate_data_stats())?;
         Ok(stats)
     }
 
     pub fn list_indexes(&self) -> Result<Arc<Vec<IndexMetadata>>> {
-        let indexes = RT.block_on(self.inner.load_indices())?;
+        let indexes = block_on(self.inner.load_indices())?;
         Ok(indexes)
     }
 
@@ -363,11 +443,13 @@ impl BlockingDataset {
         max_retries: u32,
         skip_auto_cleanup: bool,
         commit_handler: Option<Arc<dyn CommitHandler>>,
+        commit_timeout: Option<std::time::Duration>,
     ) -> Result<Self> {
         let mut builder = CommitBuilder::new(Arc::new(self.clone().inner))
             .with_store_params(store_params)
             .with_detached(detached)
-            .enable_v2_manifest_paths(enable_v2_manifest_paths);
+            .enable_v2_manifest_paths(enable_v2_manifest_paths)
+            .with_timeout(commit_timeout);
         if let Some(use_stable) = use_stable_row_ids {
             builder = builder.use_stable_row_ids(use_stable);
         }
@@ -383,12 +465,12 @@ impl BlockingDataset {
         if let Some(handler) = commit_handler {
             builder = builder.with_commit_handler(handler);
         }
-        let new_dataset = RT.block_on(builder.execute(transaction))?;
+        let new_dataset = block_on(builder.execute(transaction))?;
         Ok(BlockingDataset { inner: new_dataset })
     }
 
     pub fn read_transaction(&self) -> Result<Option<Transaction>> {
-        let transaction = RT.block_on(self.inner.read_transaction())?;
+        let transaction = block_on(self.inner.read_transaction())?;
         Ok(transaction)
     }
 
@@ -397,12 +479,8 @@ impl BlockingDataset {
     }
 
     pub fn compact(&mut self, options: RustCompactionOptions) -> Result<()> {
-        RT.block_on(compact_files(&mut self.inner, options, None))?;
+        block_on(compact_files(&mut self.inner, options, None))?;
         Ok(())
-    }
-
-    pub fn cleanup_with_policy(&mut self, policy: CleanupPolicy) -> Result<RemovalStats> {
-        Ok(RT.block_on(self.inner.cleanup_with_policy(policy))?)
     }
 
     pub fn close(&self) {}
@@ -425,10 +503,12 @@ pub extern "system" fn Java_org_lance_Dataset_createWithFfiSchema<'local>(
     data_storage_version: JObject,     // Optional<String>
     enable_v2_manifest_paths: JObject, // Optional<Boolean>
     storage_options_obj: JObject,      // Map<String, String>
+    base_store_params_obj: JObject,    // Map<String, Map<String, String>>
     initial_bases: JObject,
     target_bases: JObject,
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
     blob_pack_file_size_threshold: JObject,     // Optional<Long>
+    file_write_options: JObject,                // FileWriteOptions
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -444,10 +524,12 @@ pub extern "system" fn Java_org_lance_Dataset_createWithFfiSchema<'local>(
             data_storage_version,
             enable_v2_manifest_paths,
             storage_options_obj,
+            base_store_params_obj,
             initial_bases,
             target_bases,
             allow_external_blob_outside_bases,
             blob_pack_file_size_threshold,
+            file_write_options,
         )
     )
 }
@@ -465,10 +547,12 @@ fn inner_create_with_ffi_schema<'local>(
     data_storage_version: JObject,     // Optional<String>
     enable_v2_manifest_paths: JObject, // Optional<Boolean>
     storage_options_obj: JObject,      // Map<String, String>
+    base_store_params_obj: JObject,    // Map<String, Map<String, String>>
     initial_bases: JObject,
     target_bases: JObject,
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
     blob_pack_file_size_threshold: JObject,     // Optional<Long>
+    file_write_options: JObject,                // FileWriteOptions
 ) -> Result<JObject<'local>> {
     let c_schema_ptr = arrow_schema_addr as *mut FFI_ArrowSchema;
     let c_schema = unsafe { FFI_ArrowSchema::from_raw(c_schema_ptr) };
@@ -486,10 +570,12 @@ fn inner_create_with_ffi_schema<'local>(
         data_storage_version,
         enable_v2_manifest_paths,
         storage_options_obj,
+        base_store_params_obj,
         initial_bases,
         target_bases,
         allow_external_blob_outside_bases,
         blob_pack_file_size_threshold,
+        file_write_options,
         reader,
         None,  // No namespace for schema-only creation
         false, // No managed versioning for schema-only creation
@@ -524,7 +610,7 @@ pub extern "system" fn Java_org_lance_Dataset_nativeMigrateManifestPathsV2(
 fn inner_native_migrate_manifest_paths_v2(env: &mut JNIEnv, java_dataset: JObject) -> Result<()> {
     let mut dataset_guard =
         unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-    RT.block_on(dataset_guard.inner.migrate_manifest_paths_v2())?;
+    block_on(dataset_guard.inner.migrate_manifest_paths_v2())?;
     Ok(())
 }
 
@@ -543,10 +629,12 @@ pub extern "system" fn Java_org_lance_Dataset_createWithFfiStream<'local>(
     data_storage_version: JObject,                 // Optional<String>
     enable_v2_manifest_paths: JObject,             // Optional<Boolean>
     storage_options_obj: JObject,                  // Map<String, String>
+    base_store_params_obj: JObject,                // Map<String, Map<String, String>>
     initial_bases: JObject,                        // Optional<List<BasePath>>
     target_bases: JObject,                         // Optional<List<String>>
     allow_external_blob_outside_bases: JObject,    // Optional<Boolean>
     blob_pack_file_size_threshold: JObject,        // Optional<Long>
+    file_write_options: JObject,                   // FileWriteOptions
     namespace_obj: JObject,                        // LanceNamespace (can be null)
     table_id_obj: JObject,                         // List<String> (can be null)
     namespace_client_managed_versioning: jboolean, // Whether namespace manages versioning
@@ -565,10 +653,12 @@ pub extern "system" fn Java_org_lance_Dataset_createWithFfiStream<'local>(
             data_storage_version,
             enable_v2_manifest_paths,
             storage_options_obj,
+            base_store_params_obj,
             initial_bases,
             target_bases,
             allow_external_blob_outside_bases,
             blob_pack_file_size_threshold,
+            file_write_options,
             namespace_obj,
             table_id_obj,
             namespace_client_managed_versioning != 0,
@@ -589,10 +679,12 @@ fn inner_create_with_ffi_stream<'local>(
     data_storage_version: JObject,              // Optional<String>
     enable_v2_manifest_paths: JObject,          // Optional<Boolean>
     storage_options_obj: JObject,               // Map<String, String>
+    base_store_params_obj: JObject,             // Map<String, Map<String, String>>
     initial_bases: JObject,                     // Optional<List<BasePath>>
     target_bases: JObject,                      // Optional<List<String>>
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
     blob_pack_file_size_threshold: JObject,     // Optional<Long>
+    file_write_options: JObject,                // FileWriteOptions
     namespace_obj: JObject,                     // LanceNamespace (can be null)
     table_id_obj: JObject,                      // List<String> (can be null)
     namespace_client_managed_versioning: bool,  // Whether namespace manages versioning
@@ -614,10 +706,12 @@ fn inner_create_with_ffi_stream<'local>(
         data_storage_version,
         enable_v2_manifest_paths,
         storage_options_obj,
+        base_store_params_obj,
         initial_bases,
         target_bases,
         allow_external_blob_outside_bases,
         blob_pack_file_size_threshold,
+        file_write_options,
         reader,
         namespace_info,
         namespace_client_managed_versioning,
@@ -641,10 +735,12 @@ fn create_dataset<'local>(
     data_storage_version: JObject,
     enable_v2_manifest_paths: JObject,
     storage_options_obj: JObject,
+    base_store_params_obj: JObject,
     initial_bases: JObject,
     target_bases: JObject,
     allow_external_blob_outside_bases: JObject,
     blob_pack_file_size_threshold: JObject,
+    file_write_options: JObject,
     reader: impl RecordBatchReader + Send + 'static,
     namespace_info: Option<(Arc<dyn LanceNamespace>, Vec<String>)>,
     namespace_client_managed_versioning: bool,
@@ -661,18 +757,23 @@ fn create_dataset<'local>(
         &data_storage_version,
         Some(&enable_v2_manifest_paths),
         &storage_options_obj,
+        &base_store_params_obj,
         &initial_bases,
         &target_bases,
         &allow_external_blob_outside_bases,
         &blob_pack_file_size_threshold,
+        &file_write_options,
     )?;
 
     // Set up namespace commit handler and storage options provider if namespace is provided
     if let Some((namespace, table_id)) = namespace_info {
         // Set up commit handler only if namespace manages versioning
         if namespace_client_managed_versioning {
-            let external_store =
-                LanceNamespaceExternalManifestStore::new(namespace.clone(), table_id.clone());
+            let external_store = LanceNamespaceExternalManifestStore::for_table_uri(
+                namespace.clone(),
+                table_id.clone(),
+                &path_str,
+            )?;
             let commit_handler: Arc<dyn CommitHandler> = Arc::new(ExternalManifestCommitHandler {
                 external_manifest_store: Arc::new(external_store),
             });
@@ -746,6 +847,60 @@ impl IntoJava for Version {
             ],
         )?;
         Ok(java_version)
+    }
+}
+
+impl IntoJava for WriterVersion {
+    fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
+        let library = env.new_string(self.library)?;
+        let version = env.new_string(self.version)?;
+        let prerelease = match self.prerelease {
+            Some(value) => JObject::from(env.new_string(value)?),
+            None => JObject::null(),
+        };
+        let build_metadata = match self.build_metadata {
+            Some(value) => JObject::from(env.new_string(value)?),
+            None => JObject::null(),
+        };
+
+        Ok(env.new_object(
+            "org/lance/WriterVersion",
+            "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
+            &[
+                JValue::Object(&library),
+                JValue::Object(&version),
+                JValue::Object(&prerelease),
+                JValue::Object(&build_metadata),
+            ],
+        )?)
+    }
+}
+
+impl IntoJava for ManifestLocation {
+    fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
+        let size = self.size.ok_or_else(|| {
+            Error::runtime_error(format!("Manifest size is unavailable for {}", self.path))
+        })?;
+        let path = env.new_string(self.path.to_string())?;
+        let naming_scheme = env.new_string(match self.naming_scheme {
+            ManifestNamingScheme::V1 => "V1",
+            ManifestNamingScheme::V2 => "V2",
+        })?;
+        let e_tag = match self.e_tag {
+            Some(value) => JObject::from(env.new_string(value)?),
+            None => JObject::null(),
+        };
+        Ok(env.new_object(
+            "org/lance/ManifestLocation",
+            "(JLjava/lang/String;JLjava/lang/String;Ljava/lang/String;)V",
+            &[
+                JValue::Long(self.version as i64),
+                JValue::Object(&path),
+                JValue::Long(size as i64),
+                JValue::Object(&naming_scheme),
+                JValue::Object(&e_tag),
+            ],
+        )?)
     }
 }
 
@@ -907,7 +1062,74 @@ pub extern "system" fn Java_org_lance_Dataset_nativeCreateIndex<'local>(
             fragments_jobj,
             index_uuid_jobj,
             arrow_stream_addr_jobj,
+            None,
         )
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeCreateIndexWithProgress<'local>(
+    mut env: JNIEnv<'local>,
+    java_dataset: JObject<'local>,
+    columns_jobj: JObject<'local>, // List<String>
+    index_type_code_jobj: jint,
+    name_jobj: JObject<'local>,              // Optional<String>
+    params_jobj: JObject<'local>,            // IndexParams
+    replace_jobj: jboolean,                  // replace
+    train_jobj: jboolean,                    // train
+    fragments_jobj: JObject<'local>,         // List<Integer>
+    index_uuid_jobj: JObject<'local>,        // String
+    arrow_stream_addr_jobj: JObject<'local>, // Optional<Long>
+    progress_jobj: JObject<'local>,          // IndexBuildProgress
+) -> JObject<'local> {
+    ok_or_throw!(
+        env,
+        inner_create_index_with_progress(
+            &mut env,
+            java_dataset,
+            columns_jobj,
+            index_type_code_jobj,
+            name_jobj,
+            params_jobj,
+            replace_jobj,
+            train_jobj,
+            fragments_jobj,
+            index_uuid_jobj,
+            arrow_stream_addr_jobj,
+            progress_jobj,
+        )
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn inner_create_index_with_progress<'local>(
+    env: &mut JNIEnv<'local>,
+    java_dataset: JObject<'local>,
+    columns_jobj: JObject<'local>,
+    index_type_code_jobj: jint,
+    name_jobj: JObject<'local>,
+    params_jobj: JObject<'local>,
+    replace_jobj: jboolean,
+    train_jobj: jboolean,
+    fragments_jobj: JObject<'local>,
+    index_uuid_jobj: JObject<'local>,
+    arrow_stream_addr_jobj: JObject<'local>,
+    progress_jobj: JObject<'local>,
+) -> Result<JObject<'local>> {
+    let progress = Arc::new(JavaIndexBuildProgress::new(env, &progress_jobj)?);
+    inner_create_index(
+        env,
+        java_dataset,
+        columns_jobj,
+        index_type_code_jobj,
+        name_jobj,
+        params_jobj,
+        replace_jobj,
+        train_jobj,
+        fragments_jobj,
+        index_uuid_jobj,
+        arrow_stream_addr_jobj,
+        Some(progress),
     )
 }
 
@@ -924,6 +1146,7 @@ fn inner_create_index<'local>(
     fragments_jobj: JObject<'local>,         // Optional<List<String>>
     index_uuid_jobj: JObject<'local>,        // Optional<String>
     arrow_stream_addr_jobj: JObject<'local>, // Optional<Long>
+    progress: Option<Arc<dyn IndexBuildProgress>>,
 ) -> Result<JObject<'local>> {
     let columns = env.get_strings(&columns_jobj)?;
     let index_type = IndexType::try_from(index_type_code_jobj)?;
@@ -934,7 +1157,13 @@ fn inner_create_index<'local>(
     let fragment_ids = env
         .get_ints_opt(&fragments_jobj)?
         .map(|vec| vec.into_iter().map(|i| i as u32).collect());
-    let index_uuid = env.get_string_opt(&index_uuid_jobj)?;
+    let index_uuid = env
+        .get_string_opt(&index_uuid_jobj)?
+        .map(|s| {
+            Uuid::parse_str(&s)
+                .map_err(|e| Error::input_error(format!("Invalid UUID string for index_uuid: {e}")))
+        })
+        .transpose()?;
     let arrow_stream_addr_opt = env.get_long_opt(&arrow_stream_addr_jobj)?;
     let batch_reader = if let Some(arrow_stream_addr) = arrow_stream_addr_opt {
         let stream_ptr = arrow_stream_addr as *mut FFI_ArrowArrayStream;
@@ -957,14 +1186,16 @@ fn inner_create_index<'local>(
         | IndexType::NGram
         | IndexType::ZoneMap
         | IndexType::BloomFilter
-        | IndexType::RTree => {
+        | IndexType::Fm
+        | IndexType::RTree
+        | IndexType::MinHashLsh => {
             // For scalar indices, create a scalar IndexParams
             let (index_type_str, params_opt) = get_scalar_index_params(env, params_jobj)?;
             let scalar_params = lance_index::scalar::ScalarIndexParams {
                 index_type: index_type_str,
                 params: params_opt.clone(),
             };
-            skip_commit = skip_commit || should_skip_commit(index_type, &params_opt)?;
+            skip_commit = skip_commit || (index_type == IndexType::BTree && batch_reader.is_some());
             Ok(Box::new(scalar_params))
         }
         IndexType::FragmentReuse | IndexType::MemWal => {
@@ -989,42 +1220,143 @@ fn inner_create_index<'local>(
 
     let params = params_result?;
 
-    // Execute index creation in a block to ensure dataset_guard is dropped
-    // before we call into_java (which needs to borrow env again)
-    let index_metadata = {
-        let mut dataset_guard =
-            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+    let index_metadata = match progress {
+        Some(progress) => {
+            // Progress callbacks may re-enter read-only methods on this Dataset. Clone the Dataset
+            // and release the native field guard before the long-running build so those callbacks
+            // do not deadlock on the field mutex.
+            let mut working_dataset = {
+                let dataset_guard = unsafe {
+                    env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET)
+                }?;
+                dataset_guard.inner.clone()
+            };
+            let initial_version = working_dataset.version().version;
+            let index_metadata = execute_create_index(
+                &mut working_dataset,
+                &columns_slice,
+                index_type,
+                params.as_ref(),
+                replace,
+                train,
+                name,
+                fragment_ids,
+                index_uuid,
+                batch_reader,
+                Some(progress),
+                skip_commit,
+            )
+            .inspect_err(|_| {
+                // A committed build may fail while materializing its return metadata. The clone
+                // has already observed the durable commit, so publish it before propagating.
+                if should_publish_working_dataset_on_error(
+                    skip_commit,
+                    initial_version,
+                    working_dataset.version().version,
+                ) {
+                    match unsafe {
+                        env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET)
+                    } {
+                        Ok(mut dataset_guard) => {
+                            dataset_guard.inner = working_dataset.clone();
+                        }
+                        Err(publish_error) => {
+                            log::warn!(
+                                "Failed to publish committed dataset version {} after create-index failure: {}",
+                                working_dataset.version().version,
+                                publish_error
+                            );
+                        }
+                    }
+                }
+            })?;
 
-        let mut index_builder = dataset_guard
-            .inner
-            .create_index_builder(&columns_slice, index_type, params.as_ref())
-            .replace(replace)
-            .train(train);
-
-        if let Some(name) = name {
-            index_builder = index_builder.name(name);
+            if !skip_commit {
+                let mut dataset_guard = unsafe {
+                    env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET)
+                }?;
+                dataset_guard.inner = working_dataset;
+            }
+            index_metadata
         }
-
-        if let Some(fragment_ids) = fragment_ids {
-            index_builder = index_builder.fragments(fragment_ids);
-        }
-
-        if let Some(index_uuid) = index_uuid {
-            index_builder = index_builder.index_uuid(index_uuid);
-        }
-
-        if let Some(reader) = batch_reader {
-            index_builder = index_builder.preprocessed_data(Box::new(reader));
-        }
-
-        if skip_commit {
-            RT.block_on(index_builder.execute_uncommitted())?
-        } else {
-            RT.block_on(index_builder.into_future())?
+        None => {
+            // Preserve the existing no-progress path, including its native-field locking behavior.
+            let mut dataset_guard = unsafe {
+                env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET)
+            }?;
+            execute_create_index(
+                &mut dataset_guard.inner,
+                &columns_slice,
+                index_type,
+                params.as_ref(),
+                replace,
+                train,
+                name,
+                fragment_ids,
+                index_uuid,
+                batch_reader,
+                None,
+                skip_commit,
+            )?
         }
     };
 
     (&index_metadata).into_java(env)
+}
+
+fn should_publish_working_dataset_on_error(
+    skip_commit: bool,
+    initial_version: u64,
+    current_version: u64,
+) -> bool {
+    !skip_commit && current_version != initial_version
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_create_index(
+    dataset: &mut Dataset,
+    columns: &[&str],
+    index_type: IndexType,
+    params: &dyn IndexParams,
+    replace: bool,
+    train: bool,
+    name: Option<String>,
+    fragment_ids: Option<Vec<u32>>,
+    index_uuid: Option<Uuid>,
+    batch_reader: Option<ArrowArrayStreamReader>,
+    progress: Option<Arc<dyn IndexBuildProgress>>,
+    skip_commit: bool,
+) -> Result<IndexMetadata> {
+    let mut index_builder = dataset
+        .create_index_builder(columns, index_type, params)
+        .replace(replace)
+        .train(train);
+
+    if let Some(name) = name {
+        index_builder = index_builder.name(name);
+    }
+
+    if let Some(fragment_ids) = fragment_ids {
+        index_builder = index_builder.fragments(fragment_ids);
+    }
+
+    if let Some(index_uuid) = index_uuid {
+        index_builder = index_builder.index_uuid(index_uuid);
+    }
+
+    if let Some(reader) = batch_reader {
+        index_builder = index_builder.preprocessed_data(Box::new(reader));
+    }
+
+    if let Some(progress) = progress {
+        index_builder = index_builder.progress(progress);
+    }
+
+    if skip_commit {
+        Ok(block_on(index_builder.execute_uncommitted())?)
+    } else {
+        Ok(block_on(index_builder.into_future())?)
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -1040,22 +1372,8 @@ fn inner_drop_index(env: &mut JNIEnv, java_dataset: JObject, name: JString) -> R
     let name = name.extract(env)?;
     let mut dataset_guard =
         unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-    RT.block_on(dataset_guard.inner.drop_index(&name))?;
+    block_on(dataset_guard.inner.drop_index(&name))?;
     Ok(())
-}
-
-fn should_skip_commit(index_type: IndexType, params_opt: &Option<String>) -> Result<bool> {
-    match index_type {
-        IndexType::BTree => {
-            // Should defer the commit if we are building range-based BTree index
-            if let Some(params) = params_opt {
-                let btree_parameters = serde_json::from_str::<BTreeParameters>(params)?;
-                return Ok(btree_parameters.range_id.is_some());
-            }
-            Ok(false)
-        }
-        _ => Ok(false),
-    }
 }
 
 #[unsafe(no_mangle)]
@@ -1085,18 +1403,24 @@ fn inner_merge_index_metadata(
     index_type_code_jobj: jint,
     batch_readhead_jobj: JObject, // Optional<Integer>
 ) -> Result<()> {
-    let index_uuid = index_uuid.extract(env)?;
-    let index_type = IndexType::try_from(index_type_code_jobj)?;
-    let batch_readhead = env
-        .get_int_opt(&batch_readhead_jobj)?
-        .map(|val| val as usize);
+    let (index_uuid, index_type, batch_readhead) = parse_merge_index_metadata_args(
+        env,
+        index_uuid,
+        index_type_code_jobj,
+        batch_readhead_jobj,
+    )?;
 
-    let dataset_guard =
-        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+    // Clone the inner Dataset out of the `get_rust_field` guard and drop the
+    // guard before the long-lived merge. Otherwise nested JNI callbacks that
+    // touch the same Dataset would deadlock on the native field mutex.
+    let inner_dataset = unsafe {
+        let dataset_guard =
+            env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET)?;
+        dataset_guard.inner.clone()
+    };
 
-    RT.block_on(async {
-        dataset_guard
-            .inner
+    block_on(async {
+        inner_dataset
             .merge_index_metadata(&index_uuid, index_type, batch_readhead, noop_progress())
             .await
     })?;
@@ -1104,58 +1428,75 @@ fn inner_merge_index_metadata(
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_org_lance_Dataset_nativeBuildIndexSegments<'local>(
+pub extern "system" fn Java_org_lance_Dataset_innerMergeIndexMetadataWithProgress<'local>(
     mut env: JNIEnv<'local>,
     java_dataset: JObject,
-    java_segments: JObject,
-    index_type: jint,
-    target_segment_bytes_jobj: JObject,
-) -> JObject<'local> {
-    ok_or_throw!(
+    index_uuid: JString,
+    index_type_code_jobj: jint,
+    batch_readhead_jobj: JObject,
+    progress_jobj: JObject,
+) {
+    ok_or_throw_without_return!(
         env,
-        inner_build_index_segments(
+        inner_merge_index_metadata_with_progress(
             &mut env,
             java_dataset,
-            java_segments,
-            index_type,
-            target_segment_bytes_jobj
+            index_uuid,
+            index_type_code_jobj,
+            batch_readhead_jobj,
+            progress_jobj,
         )
-    )
+    );
 }
 
-fn inner_build_index_segments<'local>(
-    env: &mut JNIEnv<'local>,
+fn inner_merge_index_metadata_with_progress(
+    env: &mut JNIEnv,
     java_dataset: JObject,
-    java_segments: JObject,
-    index_type: jint,
-    target_segment_bytes_jobj: JObject,
-) -> Result<JObject<'local>> {
-    let segments = import_vec_to_rust(env, &java_segments, |env, obj| obj.extract_object(env))?;
-    let index_type = IndexType::try_from(index_type)?;
-    let target_segment_bytes = env
-        .get_long_opt(&target_segment_bytes_jobj)?
-        .map(|v| v as u64);
-    let template = segment_template(&segments)?;
+    index_uuid: JString,
+    index_type_code_jobj: jint,
+    batch_readhead_jobj: JObject,
+    progress_jobj: JObject,
+) -> Result<()> {
+    let (index_uuid, index_type, batch_readhead) = parse_merge_index_metadata_args(
+        env,
+        index_uuid,
+        index_type_code_jobj,
+        batch_readhead_jobj,
+    )?;
+    let progress = Arc::new(JavaIndexBuildProgress::new(env, &progress_jobj)?);
 
-    let built_segments = {
+    // Clone the inner Dataset out of the `get_rust_field` guard and drop the
+    // guard before the long-lived merge. Progress callbacks are allowed to
+    // re-enter Dataset JNI methods; holding the guard across those callbacks
+    // would deadlock on the native field mutex (see update.rs).
+    let inner_dataset = unsafe {
         let dataset_guard =
-            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        let mut builder = dataset_guard
-            .inner
-            .create_index_segment_builder()
-            .with_index_type(index_type)
-            .with_segments(segments);
-        if let Some(target_segment_bytes) = target_segment_bytes {
-            builder = builder.with_target_segment_bytes(target_segment_bytes);
-        }
-        RT.block_on(builder.build_all())?
+            env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET)?;
+        dataset_guard.inner.clone()
     };
 
-    let built_metadata = built_segments
-        .into_iter()
-        .map(|segment| index_segment_to_metadata(&template, segment))
-        .collect::<Vec<_>>();
-    export_vec(env, &built_metadata)
+    block_on(async {
+        inner_dataset
+            .merge_index_metadata(&index_uuid, index_type, batch_readhead, progress)
+            .await
+    })?;
+    Ok(())
+}
+
+fn parse_merge_index_metadata_args(
+    env: &mut JNIEnv,
+    index_uuid: JString,
+    index_type_code_jobj: jint,
+    batch_readhead_jobj: JObject,
+) -> Result<(Uuid, IndexType, Option<usize>)> {
+    let index_uuid_str = index_uuid.extract(env)?;
+    let index_uuid = Uuid::parse_str(&index_uuid_str)
+        .map_err(|e| Error::input_error(format!("Invalid UUID string for index_uuid: {e}")))?;
+    let index_type = IndexType::try_from(index_type_code_jobj)?;
+    let batch_readhead = env
+        .get_int_opt(&batch_readhead_jobj)?
+        .map(|val| val as usize);
+    Ok((index_uuid, index_type, batch_readhead))
 }
 
 #[unsafe(no_mangle)]
@@ -1179,7 +1520,7 @@ fn inner_merge_existing_index_segments<'local>(
     let merged_segment = {
         let dataset_guard =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        RT.block_on(dataset_guard.inner.merge_existing_index_segments(segments))?
+        block_on(dataset_guard.inner.merge_existing_index_segments(segments))?
     };
     (&merged_segment).into_java(env)
 }
@@ -1223,91 +1564,19 @@ fn inner_commit_existing_index_segments<'local>(
     let committed = {
         let mut dataset_guard =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        RT.block_on(dataset_guard.inner.commit_existing_index_segments(
+        block_on(dataset_guard.inner.commit_existing_index_segments(
             &index_name,
             &column,
             segments,
         ))?;
-        RT.block_on(dataset_guard.inner.load_indices_by_name(&index_name))?
+        block_on(dataset_guard.inner.load_indices_by_name(&index_name))?
     };
 
     export_vec(env, &committed)
 }
 
-struct SegmentTemplate {
-    name: String,
-    fields: Vec<i32>,
-    dataset_version: u64,
-}
-
-fn segment_template(segments: &[IndexMetadata]) -> Result<SegmentTemplate> {
-    let first = segments
-        .first()
-        .ok_or_else(|| Error::input_error("segments cannot be empty".to_string()))?;
-    for segment in &segments[1..] {
-        if segment.name != first.name {
-            return Err(Error::input_error(format!(
-                "All segments must share the same index name, got '{}' and '{}'",
-                first.name, segment.name
-            )));
-        }
-        if segment.fields != first.fields {
-            return Err(Error::input_error(format!(
-                "All segments must target the same field ids, got {:?} and {:?}",
-                first.fields, segment.fields
-            )));
-        }
-        if segment.dataset_version != first.dataset_version {
-            return Err(Error::input_error(format!(
-                "All segments must share the same dataset version, got {} and {}",
-                first.dataset_version, segment.dataset_version
-            )));
-        }
-    }
-
-    Ok(SegmentTemplate {
-        name: first.name.clone(),
-        fields: first.fields.clone(),
-        dataset_version: first.dataset_version,
-    })
-}
-
 fn index_metadata_to_segment(metadata: &IndexMetadata) -> Result<IndexSegment> {
-    let fragment_bitmap = metadata.fragment_bitmap.clone().ok_or_else(|| {
-        Error::input_error(format!(
-            "Segment '{}' is missing fragment coverage metadata",
-            metadata.uuid
-        ))
-    })?;
-    let index_details = metadata.index_details.clone().ok_or_else(|| {
-        Error::input_error(format!(
-            "Segment '{}' is missing index details metadata",
-            metadata.uuid
-        ))
-    })?;
-
-    Ok(IndexSegment::new(
-        metadata.uuid,
-        fragment_bitmap,
-        index_details,
-        metadata.index_version,
-    ))
-}
-
-fn index_segment_to_metadata(template: &SegmentTemplate, segment: IndexSegment) -> IndexMetadata {
-    let (uuid, fragment_bitmap, index_details, index_version) = segment.into_parts();
-    IndexMetadata {
-        uuid,
-        fields: template.fields.clone(),
-        name: template.name.clone(),
-        dataset_version: template.dataset_version,
-        fragment_bitmap: Some(fragment_bitmap),
-        index_details: Some(index_details),
-        index_version,
-        created_at: Some(Utc::now()),
-        base_id: None,
-        files: None,
-    }
+    Ok(metadata.clone().into_index_segment()?)
 }
 
 #[unsafe(no_mangle)]
@@ -1354,7 +1623,7 @@ fn inner_optimize_indices(
 
     let mut dataset_guard =
         unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-    RT.block_on(dataset_guard.inner.optimize_indices(&options))?;
+    block_on(dataset_guard.inner.optimize_indices(&options))?;
     Ok(())
 }
 
@@ -1367,10 +1636,12 @@ pub extern "system" fn Java_org_lance_Dataset_openNative<'local>(
     _obj: JObject,
     path: JString,
     version_obj: JObject,    // Optional<Long>
+    ref_obj: JObject,        // Optional<Ref>
     block_size_obj: JObject, // Optional<Integer>
     index_cache_size_bytes: jlong,
     metadata_cache_size_bytes: jlong,
     storage_options_obj: JObject,                  // Map<String, String>
+    base_store_params_obj: JObject,                // Map<String, Map<String, String>>
     serialized_manifest: JObject,                  // Optional<ByteBuffer>
     session_handle: jlong,                         // Session handle, 0 means no session
     namespace_obj: JObject,                        // LanceNamespace object, null if no namespace
@@ -1383,10 +1654,12 @@ pub extern "system" fn Java_org_lance_Dataset_openNative<'local>(
             &mut env,
             path,
             version_obj,
+            ref_obj,
             block_size_obj,
             index_cache_size_bytes,
             metadata_cache_size_bytes,
             storage_options_obj,
+            base_store_params_obj,
             serialized_manifest,
             session_handle,
             namespace_obj,
@@ -1396,15 +1669,55 @@ pub extern "system" fn Java_org_lance_Dataset_openNative<'local>(
     )
 }
 
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_listManifestLocationsNative<'local>(
+    mut env: JNIEnv<'local>,
+    _obj: JObject,
+    path: JString,
+    storage_options_obj: JObject,
+) -> JObject<'local> {
+    ok_or_throw!(
+        env,
+        inner_list_manifest_locations(&mut env, path, storage_options_obj)
+    )
+}
+
+fn inner_list_manifest_locations<'local>(
+    env: &mut JNIEnv<'local>,
+    path: JString,
+    storage_options_obj: JObject,
+) -> Result<JObject<'local>> {
+    let path: String = path.extract(env)?;
+    let storage_options = JMap::from_env(env, &storage_options_obj)?;
+    let storage_options = to_rust_map(env, &storage_options)?;
+    let locations = BlockingDataset::list_manifest_locations(&path, storage_options)?;
+    let list = env.new_object("java/util/ArrayList", "()V", &[])?;
+    for location in locations {
+        env.with_local_frame(8, |env| {
+            let java_location = location.into_java(env)?;
+            env.call_method(
+                &list,
+                "add",
+                "(Ljava/lang/Object;)Z",
+                &[JValue::Object(&java_location)],
+            )?;
+            Ok::<(), Error>(())
+        })?;
+    }
+    Ok(list)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn inner_open_native<'local>(
     env: &mut JNIEnv<'local>,
     path: JString,
     version_obj: JObject,    // Optional<Long>
+    ref_obj: JObject,        // Optional<Ref>
     block_size_obj: JObject, // Optional<Integer>
     index_cache_size_bytes: jlong,
     metadata_cache_size_bytes: jlong,
     storage_options_obj: JObject,              // Map<String, String>
+    base_store_params_obj: JObject,            // Map<String, Map<String, String>>
     serialized_manifest: JObject,              // Optional<ByteBuffer>
     session_handle: jlong,                     // Session handle, 0 means no session
     namespace_obj: JObject,                    // LanceNamespace object, null if no namespace
@@ -1413,9 +1726,14 @@ fn inner_open_native<'local>(
 ) -> Result<JObject<'local>> {
     let path_str: String = path.extract(env)?;
     let version = env.get_u64_opt(&version_obj)?;
+    // ReadOptions.Builder rejects setting both, so at most one of them is present.
+    let reference = env
+        .get_optional(&ref_obj, |env, jref| transform_jref_to_ref(jref, env))?
+        .or(version.map(Ref::from));
     let block_size = env.get_int_opt(&block_size_obj)?;
     let jmap = JMap::from_env(env, &storage_options_obj)?;
     let storage_options = to_rust_map(env, &jmap)?;
+    let base_store_params = extract_base_store_params(env, &base_store_params_obj)?;
 
     // Extract namespace and table_id if provided (before get_bytes_opt which holds borrow)
     let namespace_info = extract_namespace_info(env, &namespace_obj, &table_id_obj)?;
@@ -1440,11 +1758,12 @@ fn inner_open_native<'local>(
 
     let dataset = BlockingDataset::open(
         &path_str,
-        version,
+        reference,
         block_size,
         index_cache_size_bytes,
         metadata_cache_size_bytes,
         storage_options,
+        base_store_params,
         serialized_manifest,
         storage_options_provider_arc,
         session,
@@ -1536,6 +1855,97 @@ fn inner_get_fragments<'local>(
         .map(|f| f.metadata().clone())
         .collect::<Vec<Fragment>>();
     export_vec(env, &fragments)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeGetBasePaths<'a>(
+    mut env: JNIEnv<'a>,
+    jdataset: JObject,
+) -> JObject<'a> {
+    ok_or_throw!(env, inner_get_base_paths(&mut env, jdataset))
+}
+
+fn inner_get_base_paths<'local>(
+    env: &mut JNIEnv<'local>,
+    jdataset: JObject,
+) -> Result<JObject<'local>> {
+    let mut base_paths = {
+        let dataset =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
+        dataset
+            .inner
+            .manifest()
+            .base_paths
+            .values()
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    base_paths.sort_by_key(|base_path| base_path.id);
+    export_vec(env, &base_paths)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeGetFragmentStatistics<'a>(
+    mut env: JNIEnv<'a>,
+    jdataset: JObject,
+) -> JObject<'a> {
+    ok_or_throw!(env, inner_get_fragment_statistics(&mut env, jdataset))
+}
+
+/// Returns per-fragment statistics in their final Java primitive arrays.
+///
+/// Row count semantics match Java `FragmentMetadata.getNumRows()`:
+/// physical rows minus deleted rows, with absent values treated as 0.
+/// Data file count is the number of data files in the fragment.
+fn inner_get_fragment_statistics<'local>(
+    env: &mut JNIEnv<'local>,
+    jdataset: JObject,
+) -> Result<JObject<'local>> {
+    let fragments = {
+        let dataset =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
+        dataset.inner.fragments().clone()
+    };
+    let fragment_count = i32::try_from(fragments.len()).map_err(|_| {
+        Error::runtime_error(format!(
+            "Fragment statistics contain {} fragments, exceeding the Java array limit of {}",
+            fragments.len(),
+            i32::MAX
+        ))
+    })?;
+    let ids = env.new_int_array(fragment_count)?;
+    let row_counts = env.new_long_array(fragment_count)?;
+    let data_file_nums = env.new_int_array(fragment_count)?;
+
+    let mut id_values = Vec::with_capacity(fragments.len());
+    let mut row_count_values = Vec::with_capacity(fragments.len());
+    let mut data_file_num_values = Vec::with_capacity(fragments.len());
+
+    for fragment in fragments.iter() {
+        let physical_rows = fragment.physical_rows.unwrap_or(0) as i64;
+        let deleted_rows = fragment
+            .deletion_file
+            .as_ref()
+            .and_then(|deletion_file| deletion_file.num_deleted_rows)
+            .unwrap_or(0) as i64;
+        id_values.push(fragment.id as i32);
+        row_count_values.push(physical_rows - deleted_rows);
+        data_file_num_values.push(fragment.files.len() as i32);
+    }
+
+    env.set_int_array_region(&ids, 0, &id_values)?;
+    env.set_long_array_region(&row_counts, 0, &row_count_values)?;
+    env.set_int_array_region(&data_file_nums, 0, &data_file_num_values)?;
+
+    Ok(env.new_object(
+        "org/lance/FragmentStatistics",
+        "([I[J[I)V",
+        &[
+            JValue::Object(&ids),
+            JValue::Object(&row_counts),
+            JValue::Object(&data_file_nums),
+        ],
+    )?)
 }
 
 #[unsafe(no_mangle)]
@@ -1641,6 +2051,20 @@ pub extern "system" fn Java_org_lance_Dataset_nativeListVersions<'local>(
     java_dataset: JObject,
 ) -> JObject<'local> {
     ok_or_throw!(env, inner_list_versions(&mut env, java_dataset))
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeGetVersionCount(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+) -> jlong {
+    ok_or_throw_with_return!(env, inner_get_version_count(&mut env, java_dataset), -1) as jlong
+}
+
+fn inner_get_version_count(env: &mut JNIEnv, java_dataset: JObject) -> Result<u64> {
+    let dataset_guard =
+        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+    dataset_guard.count_versions()
 }
 
 fn inner_list_versions<'local>(
@@ -1865,7 +2289,7 @@ fn inner_shallow_clone<'local>(
     let new_ds = {
         let mut dataset_guard =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        RT.block_on(dataset_guard.inner.shallow_clone(
+        block_on(dataset_guard.inner.shallow_clone(
             target_path_str.as_str(),
             reference,
             storage_opts,
@@ -2023,6 +2447,29 @@ pub extern "system" fn Java_org_lance_Dataset_nativeHasStableRowIds(
     ok_or_throw_with_return!(env, inner_has_stable_row_ids(&mut env, java_dataset), 0u8)
 }
 
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeGetWriterVersion<'local>(
+    mut env: JNIEnv<'local>,
+    java_dataset: JObject,
+) -> JObject<'local> {
+    ok_or_throw!(env, inner_get_writer_version(&mut env, java_dataset))
+}
+
+fn inner_get_writer_version<'local>(
+    env: &mut JNIEnv<'local>,
+    java_dataset: JObject,
+) -> Result<JObject<'local>> {
+    let writer_version = {
+        let dataset_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+        dataset_guard.inner.manifest().writer_version.clone()
+    };
+    match writer_version {
+        Some(writer_version) => writer_version.into_java(env),
+        None => Ok(JObject::null()),
+    }
+}
+
 fn inner_has_stable_row_ids(env: &mut JNIEnv, java_dataset: JObject) -> Result<u8> {
     let dataset_guard =
         unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
@@ -2048,12 +2495,13 @@ fn inner_get_lance_file_format_version<'local>(
     let version_string = {
         let dataset_guard =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        let version = dataset_guard
+        dataset_guard
             .inner
             .manifest()
             .data_storage_format
-            .lance_file_version()?;
-        version.to_string()
+            .lance_file_format()
+            .to_manifest_string()
+            .to_string()
     };
 
     Ok(env
@@ -2095,7 +2543,59 @@ fn inner_take(
 
         let projection = ProjectionRequest::from_columns(columns, dataset.schema());
 
-        match RT.block_on(dataset.take(indices_slice, projection)) {
+        match block_on(dataset.take(indices_slice, projection)) {
+            Ok(res) => res,
+            Err(e) => {
+                return Err(e.into());
+            }
+        }
+    };
+
+    let mut buffer = Vec::new();
+    {
+        let mut writer = StreamWriter::try_new(&mut buffer, &result.schema())?;
+        writer.write(&result)?;
+        writer.finish()?;
+    }
+
+    let byte_array = env.byte_array_from_slice(&buffer)?;
+    Ok(**byte_array)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeTakeRows(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+    row_ids_obj: JObject, // List<Long>
+    columns_obj: JObject, // List<String>
+) -> jbyteArray {
+    match inner_take_rows(&mut env, java_dataset, row_ids_obj, columns_obj) {
+        Ok(byte_array) => byte_array,
+        Err(e) => {
+            let _ = env.throw_new("java/lang/RuntimeException", format!("{:?}", e));
+            std::ptr::null_mut()
+        }
+    }
+}
+
+fn inner_take_rows(
+    env: &mut JNIEnv,
+    java_dataset: JObject,
+    row_ids_obj: JObject, // List<Long>
+    columns_obj: JObject, // List<String>
+) -> Result<jbyteArray> {
+    let row_ids: Vec<i64> = env.get_longs(&row_ids_obj)?;
+    let row_ids_u64: Vec<u64> = row_ids.iter().map(|&x| x as u64).collect();
+    let columns: Vec<String> = env.get_strings(&columns_obj)?;
+
+    let result = {
+        let dataset_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+        let dataset = &dataset_guard.inner;
+
+        let projection = ProjectionRequest::from_columns(columns, dataset.schema());
+
+        match block_on(dataset.take_rows(&row_ids_u64, projection)) {
             Ok(res) => res,
             Err(e) => {
                 return Err(e.into());
@@ -2153,7 +2653,7 @@ fn inner_sample(
             .project_preserve_system_columns(&columns)
             .map_err(|e| Error::runtime_error(e.to_string()))?;
 
-        match RT.block_on(dataset.sample(n as usize, &projection, fragment_ids_u32.as_deref())) {
+        match block_on(dataset.sample(n as usize, &projection, fragment_ids_u32.as_deref())) {
             Ok(res) => res,
             Err(e) => {
                 return Err(e.into());
@@ -2185,7 +2685,7 @@ fn inner_delete(env: &mut JNIEnv, java_dataset: JObject, predicate: JString) -> 
     let predicate_str = predicate.extract(env)?;
     let mut dataset_guard =
         unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-    RT.block_on(dataset_guard.inner.delete(&predicate_str))?;
+    block_on(dataset_guard.inner.delete(&predicate_str))?;
     Ok(())
 }
 
@@ -2200,7 +2700,7 @@ pub extern "system" fn Java_org_lance_Dataset_nativeTruncateTable(
 fn inner_truncate_table(env: &mut JNIEnv, java_dataset: JObject) -> Result<()> {
     let mut dataset_guard =
         unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-    RT.block_on(dataset_guard.inner.truncate_table())?;
+    block_on(dataset_guard.inner.truncate_table())?;
     Ok(())
 }
 
@@ -2225,7 +2725,7 @@ fn inner_drop_columns(
     let columns_slice: Vec<&str> = columns.iter().map(AsRef::as_ref).collect();
     let mut dataset_guard =
         unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-    RT.block_on(dataset_guard.inner.drop_columns(&columns_slice))?;
+    block_on(dataset_guard.inner.drop_columns(&columns_slice))?;
     Ok(())
 }
 
@@ -2234,17 +2734,23 @@ pub extern "system" fn Java_org_lance_Dataset_nativeAlterColumns(
     mut env: JNIEnv,
     java_dataset: JObject,
     column_alterations_obj: JObject, // List<ColumnAlteration>
+    cast_schema_addr: jlong,
 ) {
     ok_or_throw_without_return!(
         env,
-        inner_alter_columns(&mut env, java_dataset, column_alterations_obj)
+        inner_alter_columns(
+            &mut env,
+            java_dataset,
+            column_alterations_obj,
+            cast_schema_addr
+        )
     )
 }
 
 fn create_column_alteration(
     env: &mut JNIEnv,
     column_alteration_jobj: JObject, // ColumnAlteration
-) -> Result<ColumnAlteration> {
+) -> Result<(ColumnAlteration, bool)> {
     let path_obj = env
         .get_field(&column_alteration_jobj, "path", "Ljava/lang/String;")?
         .l()?;
@@ -2283,54 +2789,61 @@ fn create_column_alteration(
         None
     };
 
+    // The cast target type (if any) is not read here: it is transferred separately through the
+    // Arrow C Data Interface (see inner_alter_columns), because ArrowType#toString() does not
+    // round-trip through DataType::from_str for parameterized types. This flag records whether a
+    // cast was requested so the caller can attach the imported type in order.
     let data_type_obj = env
         .get_field(&column_alteration_jobj, "dataType", "Ljava/util/Optional;")?
         .l()?;
-    let data_type = if env
+    let wants_cast = env
         .call_method(&data_type_obj, "isPresent", "()Z", &[])?
-        .z()?
-    {
-        let j_data_type: JObject = env
-            .call_method(data_type_obj, "get", "()Ljava/lang/Object;", &[])?
-            .l()?;
-        let jstring: JString = env
-            .call_method(j_data_type, "toString", "()Ljava/lang/String;", &[])?
-            .l()?
-            .into();
-        let data_type_str: String = env.get_string(&jstring)?.into(); // Intermediate variable
-        DataType::from_str(&data_type_str)
-            .map_err(|e| Error::input_error(e.to_string()))
-            .ok()
-    } else {
-        None
-    };
+        .z()?;
 
-    Ok(ColumnAlteration {
+    let alteration = ColumnAlteration {
         path,
         rename,
         nullable,
-        data_type,
-    })
+        data_type: None,
+    };
+    Ok((alteration, wants_cast))
 }
 
 fn inner_alter_columns(
     env: &mut JNIEnv,
     java_dataset: JObject,
     column_alterations_obj: JObject, // List<ColumnAlteration>
+    cast_schema_addr: jlong,
 ) -> Result<()> {
     let list = env.get_list(&column_alterations_obj)?;
     let mut iter = list.iter(env)?;
     let mut column_alterations = Vec::new();
+    let mut cast_flags = Vec::new();
 
     while let Some(elem) = iter.next(env)? {
-        let alteration = create_column_alteration(env, elem)?;
+        let (alteration, wants_cast) = create_column_alteration(env, elem)?;
         column_alterations.push(alteration);
+        cast_flags.push(wants_cast);
+    }
+
+    // Cast target types arrive as one Arrow schema field per requested cast, in the same order
+    // as the alterations that requested one.
+    let cast_schema = unsafe { FFI_ArrowSchema::from_raw(cast_schema_addr as *mut _) };
+    let cast_schema = ArrowSchema::try_from(&cast_schema)
+        .map_err(|_| Error::input_error("ArrowSchema conversion error".to_string()))?;
+    let mut cast_types = cast_schema.fields.iter().map(|f| f.data_type().clone());
+    for (alteration, wants_cast) in column_alterations.iter_mut().zip(cast_flags) {
+        if wants_cast {
+            alteration.data_type = Some(cast_types.next().ok_or_else(|| {
+                Error::input_error("Missing cast type for column alteration".to_string())
+            })?);
+        }
     }
 
     let mut dataset_guard =
         unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
 
-    RT.block_on(dataset_guard.inner.alter_columns(&column_alterations))?;
+    block_on(dataset_guard.inner.alter_columns(&column_alterations))?;
     Ok(())
 }
 
@@ -2388,7 +2901,7 @@ fn inner_add_columns_by_sql_expressions(
     let mut dataset_guard =
         unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
 
-    RT.block_on(
+    block_on(
         dataset_guard
             .inner
             .add_columns(rust_transform, None, batch_size),
@@ -2433,7 +2946,7 @@ fn inner_add_columns_by_reader(
     let mut dataset_guard =
         unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
 
-    RT.block_on(dataset_guard.inner.add_columns(transform, None, batch_size))?;
+    block_on(dataset_guard.inner.add_columns(transform, None, batch_size))?;
 
     Ok(())
 }
@@ -2464,7 +2977,7 @@ fn inner_add_columns_by_schema(
     let mut dataset_guard =
         unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
 
-    RT.block_on(dataset_guard.inner.add_columns(transform, None, None))?;
+    block_on(dataset_guard.inner.add_columns(transform, None, None))?;
 
     Ok(())
 }
@@ -2764,7 +3277,7 @@ fn inner_create_branch<'local>(
     let new_blocking_dataset = {
         let mut dataset_guard =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        let inner = RT.block_on(dataset_guard.inner.create_branch(
+        let inner = block_on(dataset_guard.inner.create_branch(
             branch_name.as_str(),
             reference,
             storage_opts,
@@ -3066,6 +3579,38 @@ fn convert_java_compaction_options_to_rust(
             &[],
         )?
         .l()?;
+    let max_source_rows = env
+        .call_method(
+            &java_options,
+            "getMaxSourceRows",
+            "()Ljava/util/Optional;",
+            &[],
+        )?
+        .l()?;
+    let max_source_bytes = env
+        .call_method(
+            &java_options,
+            "getMaxSourceBytes",
+            "()Ljava/util/Optional;",
+            &[],
+        )?
+        .l()?;
+    let excluded_fragment_ids = env
+        .call_method(
+            &java_options,
+            "getExcludedFragmentIds",
+            "()Ljava/util/List;",
+            &[],
+        )?
+        .l()?;
+    let data_storage_version = env
+        .call_method(
+            &java_options,
+            "getDataStorageVersion",
+            "()Ljava/util/Optional;",
+            &[],
+        )?
+        .l()?;
 
     build_compaction_options(
         env,
@@ -3080,6 +3625,10 @@ fn convert_java_compaction_options_to_rust(
         &compaction_mode,
         &binary_copy_read_batch_bytes,
         &max_source_fragments,
+        &max_source_rows,
+        &max_source_bytes,
+        &excluded_fragment_ids,
+        &data_storage_version,
         config,
     )
 }
@@ -3089,62 +3638,164 @@ pub extern "system" fn Java_org_lance_Dataset_nativeCleanupWithPolicy<'local>(
     mut env: JNIEnv<'local>,
     jdataset: JObject,
     jpolicy: JObject,
+    jdelete_concurrency: JObject,
+    jdelete_rate_limit: JObject,
 ) -> JObject<'local> {
-    ok_or_throw!(env, inner_cleanup_with_policy(&mut env, jdataset, jpolicy))
+    ok_or_throw!(
+        env,
+        inner_cleanup_with_policy(
+            &mut env,
+            jdataset,
+            jpolicy,
+            jdelete_concurrency,
+            jdelete_rate_limit
+        )
+    )
 }
 
 fn inner_cleanup_with_policy<'local>(
     env: &mut JNIEnv<'local>,
     jdataset: JObject,
     jpolicy: JObject,
+    jdelete_concurrency: JObject,
+    jdelete_rate_limit: JObject,
 ) -> Result<JObject<'local>> {
-    let before_ts_millis =
-        env.get_optional_u64_from_method(&jpolicy, "getBeforeTimestampMillis")?;
+    let policy = extract_cleanup_policy(env, &jpolicy)?;
+    let delete_concurrency = env.get_optional(&jdelete_concurrency, |env, obj| {
+        let value = env.call_method(obj, "longValue", "()J", &[])?.j()?;
+        usize::try_from(value).map_err(|_| {
+            Error::input_error(format!(
+                "delete_concurrency is out of range for usize, got {value}"
+            ))
+        })
+    })?;
+
+    let delete_rate_limit = env.get_optional(&jdelete_rate_limit, |env, obj| {
+        let value = env.call_method(obj, "longValue", "()J", &[])?.j()?;
+        u64::try_from(value).map_err(|_| {
+            Error::input_error(format!(
+                "delete_rate_limit is out of range for u64, got {value}"
+            ))
+        })
+    })?;
+    let stats = {
+        let dataset =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
+        let mut operation = dataset.inner.cleanup(policy);
+        if let Some(concurrency) = delete_concurrency {
+            operation = operation.with_delete_concurrency(concurrency)?;
+        }
+        if let Some(rate) = delete_rate_limit {
+            operation = operation.with_delete_rate_limit(rate)?;
+        }
+        block_on(operation.execute())
+    }?;
+
+    cleanup_stats_to_java(env, stats)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeExplainCleanupWithPolicy<'local>(
+    mut env: JNIEnv<'local>,
+    jdataset: JObject,
+    jpolicy: JObject,
+    jmax_candidate_files: JObject,
+) -> JObject<'local> {
+    ok_or_throw!(
+        env,
+        inner_explain_cleanup_with_policy(&mut env, jdataset, jpolicy, jmax_candidate_files)
+    )
+}
+
+fn inner_explain_cleanup_with_policy<'local>(
+    env: &mut JNIEnv<'local>,
+    jdataset: JObject,
+    jpolicy: JObject,
+    jmax_candidate_files: JObject,
+) -> Result<JObject<'local>> {
+    let policy = extract_cleanup_policy(env, &jpolicy)?;
+    let max_candidate_files = env
+        .get_optional(&jmax_candidate_files, |env, inner| {
+            Ok(env.call_method(inner, "longValue", "()J", &[])?.j()?)
+        })?
+        .map(|v| {
+            usize::try_from(v).map_err(|e| {
+                Error::input_error(format!(
+                    "maxCandidateFiles must be a non-negative usize value, got {}: {:?}",
+                    v, e
+                ))
+            })
+        })
+        .transpose()?;
+
+    let explanation = {
+        let dataset =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
+        let mut operation = dataset.inner.cleanup(policy);
+        if let Some(limit) = max_candidate_files {
+            operation = operation.with_max_candidate_files(limit);
+        }
+        block_on(operation.explain())
+    }?;
+
+    cleanup_explanation_to_java(env, explanation)
+}
+
+fn extract_cleanup_policy(env: &mut JNIEnv<'_>, jpolicy: &JObject) -> Result<CleanupPolicy> {
+    let before_ts_millis = env.get_optional_u64_from_method(jpolicy, "getBeforeTimestampMillis")?;
     let before_timestamp = before_ts_millis.map(|millis| {
         let st = UNIX_EPOCH + Duration::from_millis(millis);
         DateTime::<Utc>::from(st)
     });
 
-    let before_version = env.get_optional_u64_from_method(&jpolicy, "getBeforeVersion")?;
+    let before_version = env.get_optional_u64_from_method(jpolicy, "getBeforeVersion")?;
+
+    let versions = env.get_optional_from_method(jpolicy, "getVersions", |env, list_obj| {
+        let mut versions = HashSet::new();
+        for version in env.get_longs(&list_obj)? {
+            versions.insert(version as u64);
+        }
+        Ok(versions)
+    })?;
 
     let delete_unverified = env
-        .get_optional_from_method(&jpolicy, "getDeleteUnverified", |env, obj| {
+        .get_optional_from_method(jpolicy, "getDeleteUnverified", |env, obj| {
             Ok(env.call_method(obj, "booleanValue", "()Z", &[])?.z()?)
         })?
         .unwrap_or(false);
 
     let error_if_tagged_old_versions = env
-        .get_optional_from_method(&jpolicy, "getErrorIfTaggedOldVersions", |env, obj| {
+        .get_optional_from_method(jpolicy, "getErrorIfTaggedOldVersions", |env, obj| {
             Ok(env.call_method(obj, "booleanValue", "()Z", &[])?.z()?)
         })?
         .unwrap_or(true);
 
     let clean_referenced_branches = env
-        .get_optional_from_method(&jpolicy, "getCleanReferencedBranches", |env, obj| {
+        .get_optional_from_method(jpolicy, "getCleanReferencedBranches", |env, obj| {
             Ok(env.call_method(obj, "booleanValue", "()Z", &[])?.z()?)
         })?
         .unwrap_or(false);
 
-    let delete_rate_limit = env.get_optional_u64_from_method(&jpolicy, "getDeleteRateLimit")?;
+    let delete_rate_limit = env.get_optional_u64_from_method(jpolicy, "getDeleteRateLimit")?;
 
-    let policy = CleanupPolicy {
+    Ok(CleanupPolicy {
         before_timestamp,
         before_version,
+        versions,
         delete_unverified,
         error_if_tagged_old_versions,
         clean_referenced_branches,
         delete_rate_limit,
-    };
+    })
+}
 
-    let stats = {
-        let mut dataset =
-            unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
-        dataset.cleanup_with_policy(policy)
-    }?;
-
-    let jstats = env.new_object(
+fn cleanup_stats_to_java<'local>(
+    env: &mut JNIEnv<'local>,
+    stats: RemovalStats,
+) -> Result<JObject<'local>> {
+    Ok(env.new_object(
         "org/lance/cleanup/RemovalStats",
-        "(JJJJJJ)V",
+        "(JJJJJJJ)V",
         &[
             JValue::Long(stats.bytes_removed as i64),
             JValue::Long(stats.old_versions as i64),
@@ -3152,10 +3803,128 @@ fn inner_cleanup_with_policy<'local>(
             JValue::Long(stats.transaction_files_removed as i64),
             JValue::Long(stats.index_files_removed as i64),
             JValue::Long(stats.deletion_files_removed as i64),
+            JValue::Long(stats.failed_deletes as i64),
         ],
-    )?;
+    )?)
+}
 
-    Ok(jstats)
+fn cleanup_file_kind_to_java(kind: CleanupFileKind) -> &'static str {
+    match kind {
+        CleanupFileKind::Manifest => "manifest",
+        CleanupFileKind::Data => "data",
+        CleanupFileKind::Transaction => "transaction",
+        CleanupFileKind::Index => "index",
+        CleanupFileKind::Deletion => "deletion",
+        CleanupFileKind::TemporaryManifest => "temporary_manifest",
+    }
+}
+
+fn cleanup_candidate_files_to_java<'local>(
+    env: &mut JNIEnv<'local>,
+    files: Vec<CleanupCandidateFile>,
+) -> Result<JObject<'local>> {
+    let list = env.new_object("java/util/ArrayList", "()V", &[])?;
+    // Wrap each iteration in a local frame so the temporary path/kind/candidate
+    // references do not accumulate on the JNI local reference table for large
+    // explanations (default limit is 1000 candidate files, but users can raise it).
+    for file in files {
+        env.with_local_frame(8, |env| {
+            let path = env.new_string(file.path)?;
+            let kind = env.new_string(cleanup_file_kind_to_java(file.kind))?;
+            let candidate = env.new_object(
+                "org/lance/cleanup/CleanupCandidateFile",
+                "(Ljava/lang/String;Ljava/lang/String;ZJ)V",
+                &[
+                    JValue::Object(&path),
+                    JValue::Object(&kind),
+                    JValue::Bool(file.unverified as jboolean),
+                    JValue::Long(file.size_bytes as i64),
+                ],
+            )?;
+            env.call_method(
+                &list,
+                "add",
+                "(Ljava/lang/Object;)Z",
+                &[JValue::Object(&candidate)],
+            )?;
+            Ok::<(), Error>(())
+        })?;
+    }
+    Ok(list)
+}
+
+fn cleanup_referenced_branches_to_java<'local>(
+    env: &mut JNIEnv<'local>,
+    branches: Vec<CleanupReferencedBranch>,
+) -> Result<JObject<'local>> {
+    let list = env.new_object("java/util/ArrayList", "()V", &[])?;
+    for branch in branches {
+        env.with_local_frame(8, |env| {
+            let name = env.new_string(branch.name)?;
+            let referenced_branch = env.new_object(
+                "org/lance/cleanup/CleanupReferencedBranch",
+                "(Ljava/lang/String;JZ)V",
+                &[
+                    JValue::Object(&name),
+                    JValue::Long(branch.referenced_version as i64),
+                    JValue::Bool(branch.cleanup_candidate as jboolean),
+                ],
+            )?;
+            env.call_method(
+                &list,
+                "add",
+                "(Ljava/lang/Object;)Z",
+                &[JValue::Object(&referenced_branch)],
+            )?;
+            Ok::<(), Error>(())
+        })?;
+    }
+    Ok(list)
+}
+
+fn cleanup_warnings_to_java<'local>(
+    env: &mut JNIEnv<'local>,
+    warnings: Vec<String>,
+) -> Result<JObject<'local>> {
+    let list = env.new_object("java/util/ArrayList", "()V", &[])?;
+    for warning in warnings {
+        env.with_local_frame(4, |env| {
+            let warning = env.new_string(warning)?;
+            env.call_method(
+                &list,
+                "add",
+                "(Ljava/lang/Object;)Z",
+                &[JValue::Object(&warning)],
+            )?;
+            Ok::<(), Error>(())
+        })?;
+    }
+    Ok(list)
+}
+
+fn cleanup_explanation_to_java<'local>(
+    env: &mut JNIEnv<'local>,
+    explanation: CleanupExplanation,
+) -> Result<JObject<'local>> {
+    let stats = cleanup_stats_to_java(env, explanation.stats)?;
+    let candidate_files = cleanup_candidate_files_to_java(env, explanation.candidate_files)?;
+    let referenced_branches =
+        cleanup_referenced_branches_to_java(env, explanation.referenced_branches)?;
+    let warnings = cleanup_warnings_to_java(env, explanation.warnings)?;
+
+    Ok(env.new_object(
+        "org/lance/cleanup/CleanupExplanation",
+        "(JLorg/lance/cleanup/RemovalStats;Ljava/util/List;ZJLjava/util/List;Ljava/util/List;)V",
+        &[
+            JValue::Long(explanation.read_version as i64),
+            JValue::Object(&stats),
+            JValue::Object(&candidate_files),
+            JValue::Bool(explanation.candidate_files_truncated as jboolean),
+            JValue::Long(explanation.candidate_file_limit as i64),
+            JValue::Object(&referenced_branches),
+            JValue::Object(&warnings),
+        ],
+    )?)
 }
 
 //////////////////////////////
@@ -3217,7 +3986,7 @@ fn inner_get_index_statistics<'local>(
     let stats_json = {
         let dataset_guard =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        RT.block_on(dataset_guard.inner.index_statistics(&index_name))?
+        block_on(dataset_guard.inner.index_statistics(&index_name))?
     };
     let jstats = env.new_string(stats_json)?;
     Ok(jstats)
@@ -3252,14 +4021,17 @@ fn inner_describe_indices<'local>(
             for_column: for_column.as_deref(),
             has_name: has_name.as_deref(),
             must_support_fts,
+            fts_document_granularity: None,
             must_support_exact_equality,
+            must_support_suffix_array: false,
+            must_support_minhash: false,
         })
     })?;
 
     let descriptions = {
         let dataset_guard =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        RT.block_on(dataset_guard.inner.describe_indices(index_criteria))?
+        block_on(dataset_guard.inner.describe_indices(index_criteria))?
     };
 
     export_vec(env, &descriptions)
@@ -3283,73 +4055,105 @@ pub extern "system" fn Java_org_lance_Dataset_nativeCountIndexedRows(
 fn inner_count_indexed_rows(
     env: &mut JNIEnv,
     java_dataset: JObject,
-    _jindex_name: JString,
+    jindex_name: JString,
     jfilter: JString,
     jfragment_ids: JObject, // Optional<List<Integer>>
 ) -> Result<i64> {
+    let index_name: String = jindex_name.extract(env)?;
     let filter: String = jfilter.extract(env)?;
+    let fragment_ids = extract_count_fragment_ids(env, &jfragment_ids)?;
 
-    // Extract optional fragment IDs
-    let fragment_ids: Option<Vec<u32>> = if env
-        .call_method(&jfragment_ids, "isPresent", "()Z", &[])?
-        .z()?
-    {
-        let list_obj = env
-            .call_method(&jfragment_ids, "get", "()Ljava/lang/Object;", &[])?
-            .l()?;
-        let list = env.get_list(&list_obj)?;
-        let mut ids = Vec::new();
-        let mut iter = list.iter(env)?;
-        while let Some(elem) = iter.next(env)? {
-            let int_val = env.call_method(&elem, "intValue", "()I", &[])?.i()?;
-            ids.push(int_val as u32);
-        }
-        Some(ids)
-    } else {
-        None
-    };
+    count_indexed_rows(env, java_dataset, index_name, filter, None, fragment_ids)
+}
 
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeCountIndexedRowsWithSegments(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+    jindex_name: JString,
+    jfilter: JString,
+    jsegment_uuids: JObject, // List<UUID>
+    jfragment_ids: JObject,  // Optional<List<Integer>>
+) -> jlong {
+    ok_or_throw_with_return!(
+        env,
+        inner_count_indexed_rows_with_segments(
+            &mut env,
+            java_dataset,
+            jindex_name,
+            jfilter,
+            jsegment_uuids,
+            jfragment_ids,
+        ),
+        -1
+    )
+}
+
+fn inner_count_indexed_rows_with_segments(
+    env: &mut JNIEnv,
+    java_dataset: JObject,
+    jindex_name: JString,
+    jfilter: JString,
+    jsegment_uuids: JObject,
+    jfragment_ids: JObject,
+) -> Result<i64> {
+    let index_name: String = jindex_name.extract(env)?;
+    let filter: String = jfilter.extract(env)?;
+    let segment_uuids =
+        import_vec_to_rust(env, &jsegment_uuids, |env, obj| obj.extract_object(env))?;
+    let fragment_ids = extract_count_fragment_ids(env, &jfragment_ids)?;
+
+    count_indexed_rows(
+        env,
+        java_dataset,
+        index_name,
+        filter,
+        Some(segment_uuids),
+        fragment_ids,
+    )
+}
+
+fn extract_count_fragment_ids(
+    env: &mut JNIEnv,
+    jfragment_ids: &JObject,
+) -> Result<Option<Vec<u32>>> {
+    env.get_ints_opt(jfragment_ids)?
+        .map(|fragment_ids| {
+            fragment_ids
+                .into_iter()
+                .map(|fragment_id| {
+                    u32::try_from(fragment_id).map_err(|_| {
+                        Error::input_error(format!(
+                            "fragment ID must be non-negative, got {fragment_id}"
+                        ))
+                    })
+                })
+                .collect()
+        })
+        .transpose()
+}
+
+fn count_indexed_rows(
+    env: &mut JNIEnv,
+    java_dataset: JObject,
+    index_name: String,
+    filter: String,
+    segment_uuids: Option<Vec<Uuid>>,
+    fragment_ids: Option<Vec<u32>>,
+) -> Result<i64> {
     let count = {
         let dataset_guard =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-
-        // Use a scanner with fragment filtering to count rows
-        // This ensures we only count rows in the specified fragments
-        let inner = dataset_guard.inner.clone();
-
-        RT.block_on(async {
-            let mut scanner = inner.scan();
-
-            // Apply filter
-            if !filter.is_empty() {
-                scanner.filter(&filter)?;
-            }
-
-            // Empty projection and enable row_id for count_rows to work
-            // count_rows() requires metadata-only projection
-            scanner.project::<String>(&[])?;
-            scanner.with_row_id();
-
-            // Apply fragment filter if specified
-            if let Some(frag_ids) = fragment_ids {
-                // Convert FileFragment to Fragment by extracting metadata
-                let filtered_fragments: Vec<_> = inner
-                    .get_fragments()
-                    .into_iter()
-                    .filter(|f| frag_ids.contains(&(f.id() as u32)))
-                    .map(|f| f.metadata().clone())
-                    .collect();
-                scanner.with_fragments(filtered_fragments);
-            }
-
-            // Use the scanner's count_rows method
-            let count = scanner.count_rows().await?;
-
-            Ok::<i64, lance::Error>(count as i64)
-        })?
+        block_on(dataset_guard.inner.count_indexed_rows(
+            &index_name,
+            &filter,
+            segment_uuids.as_deref(),
+            fragment_ids.as_deref(),
+        ))?
     };
 
-    Ok(count)
+    i64::try_from(count)
+        .map_err(|_| Error::input_error(format!("indexed row count {count} exceeds Java long")))
 }
 
 //////////////////////////////
@@ -3422,14 +4226,17 @@ fn inner_get_zonemap_stats<'local>(
         })?;
 
         // Do all async work in a single block_on call to avoid nested runtime issues
-        RT.block_on(async {
+        block_on(async {
             // Find the zonemap index for this column using describe_indices
             let descriptions = dataset
                 .describe_indices(Some(lance_index::IndexCriteria {
                     for_column: Some(&column_name),
                     has_name: None,
                     must_support_fts: false,
+                    fts_document_granularity: None,
                     must_support_exact_equality: false,
+                    must_support_suffix_array: false,
+                    must_support_minhash: false,
                 }))
                 .await
                 .map_err(Error::from)?;
@@ -3572,4 +4379,24 @@ fn inner_get_zonemap_stats<'local>(
     }
 
     Ok(array_list)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_publish_working_dataset_on_error;
+
+    #[test]
+    fn post_commit_failure_publishes_advanced_dataset() {
+        assert!(should_publish_working_dataset_on_error(false, 1, 2));
+    }
+
+    #[test]
+    fn pre_commit_failure_keeps_original_dataset() {
+        assert!(!should_publish_working_dataset_on_error(false, 1, 1));
+    }
+
+    #[test]
+    fn uncommitted_failure_keeps_original_dataset() {
+        assert!(!should_publish_working_dataset_on_error(true, 1, 2));
+    }
 }

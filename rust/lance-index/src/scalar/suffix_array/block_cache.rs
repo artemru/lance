@@ -175,8 +175,8 @@ impl BlockCache {
     }
 }
 
-impl deepsize::DeepSizeOf for BlockCache {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+impl lance_core::deepsize::DeepSizeOf for BlockCache {
+    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
         // Approximate: we can't await inside DeepSizeOf, so estimate
         // based on file_size as upper bound. Actual cached size is lower.
         // The LRU cache in SuffixArrayIndex tracks segment size via

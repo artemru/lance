@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-#![recursion_limit = "256"]
-
 /// This is a rust end-to-end benchmark for full text search.  It is meant to be supplementary to the
 /// python benchmark located at python/python/ci_benchmarks/benchmarks/test_fts_search.py.  You can use
 /// the python/python/ci_benchmarks/datagen/wikipedia.py script to generate the dataset.  You will need
@@ -22,7 +20,7 @@ use lance_index::{
     scalar::{FullTextSearchQuery, inverted::tokenizer::InvertedIndexParams},
 };
 #[cfg(target_os = "linux")]
-use pprof::criterion::{Output, PProfProfiler};
+use lance_testing::pprof::{Output, PProfProfiler};
 use tempfile::TempDir;
 
 const WIKIPEDIA_DATASET_ENV_VAR: &str = "LANCE_WIKIPEDIA_DATASET_PATH";
@@ -145,15 +143,8 @@ async fn build_segmented_fts_dataset(segment_count: usize) -> BenchDataset {
             .unwrap();
         staged_segments.push(segment);
     }
-    let segments = dataset
-        .create_index_segment_builder()
-        .with_index_type(IndexType::Inverted)
-        .with_segments(staged_segments)
-        .build_all()
-        .await
-        .unwrap();
     dataset
-        .commit_existing_index_segments(INDEX_NAME, "text", segments)
+        .commit_existing_index_segments(INDEX_NAME, "text", staged_segments)
         .await
         .unwrap();
 
@@ -228,15 +219,8 @@ async fn build_partition_compare_dataset_with_memory_limit(
             .unwrap();
         staged_segments.push(segment);
     }
-    let segments = dataset
-        .create_index_segment_builder()
-        .with_index_type(IndexType::Inverted)
-        .with_segments(staged_segments)
-        .build_all()
-        .await
-        .unwrap();
     dataset
-        .commit_existing_index_segments(PARTITION_COMPARE_INDEX_NAME, "text", segments)
+        .commit_existing_index_segments(PARTITION_COMPARE_INDEX_NAME, "text", staged_segments)
         .await
         .unwrap();
 

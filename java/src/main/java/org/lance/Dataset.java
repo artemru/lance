@@ -13,11 +13,14 @@
  */
 package org.lance;
 
+import org.lance.cleanup.CleanupExplanation;
 import org.lance.cleanup.CleanupPolicy;
 import org.lance.cleanup.RemovalStats;
 import org.lance.compaction.CompactionOptions;
 import org.lance.delta.DatasetDelta;
+import org.lance.file.FileWriteOptions;
 import org.lance.index.Index;
+import org.lance.index.IndexBuildProgress;
 import org.lance.index.IndexCriteria;
 import org.lance.index.IndexDescription;
 import org.lance.index.IndexOptions;
@@ -28,6 +31,10 @@ import org.lance.index.scalar.ZoneStats;
 import org.lance.ipc.DataStatistics;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
+import org.lance.memwal.InitializeMemWalParams;
+import org.lance.memwal.MemWalIndexDetails;
+import org.lance.memwal.ShardWriter;
+import org.lance.memwal.ShardWriterConfig;
 import org.lance.merge.MergeInsertParams;
 import org.lance.merge.MergeInsertResult;
 import org.lance.namespace.LanceNamespace;
@@ -36,6 +43,8 @@ import org.lance.operation.UpdateMap;
 import org.lance.schema.ColumnAlteration;
 import org.lance.schema.LanceSchema;
 import org.lance.schema.SqlExpressions;
+import org.lance.update.UpdateParams;
+import org.lance.update.UpdateResult;
 import org.lance.util.JsonUtils;
 
 import org.apache.arrow.c.ArrowArrayStream;
@@ -47,6 +56,7 @@ import org.apache.arrow.util.Preconditions;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.arrow.vector.ipc.ArrowStreamReader;
 import org.apache.arrow.vector.types.pojo.Field;
+import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.pojo.Schema;
 
 import java.io.ByteArrayInputStream;
@@ -55,11 +65,14 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.Channels;
 import java.nio.channels.ReadableByteChannel;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Collectors;
 
 /**
@@ -80,7 +93,13 @@ public class Dataset implements Closeable {
   private Session session;
   private boolean ownsSession = false;
 
-  private final LockManager lockManager = new LockManager();
+  /**
+   * Serializes create/merge index builds on this Dataset handle. Always acquire the lifecycle read
+   * lock first so a queued close cannot deadlock a reentrant read-lock owner.
+   */
+  private final ReentrantLock indexBuildLock = new ReentrantLock();
+
+  private final LockManager lockManager = new LockManager(this);
 
   private Dataset() {}
 
@@ -150,10 +169,12 @@ public class Dataset implements Closeable {
               params.getDataStorageVersion(),
               params.getEnableV2ManifestPaths(),
               params.getStorageOptions(),
+              params.getBaseStoreParams(),
               params.getInitialBases(),
               params.getTargetBases(),
               params.getAllowExternalBlobOutsideBases(),
-              params.getBlobPackFileSizeThreshold());
+              params.getBlobPackFileSizeThreshold(),
+              params.getFileWriteOptions());
       dataset.allocator = allocator;
       return dataset;
     }
@@ -198,10 +219,12 @@ public class Dataset implements Closeable {
       Optional<String> dataStorageVersion,
       Optional<Boolean> enableV2ManifestPaths,
       Map<String, String> storageOptions,
+      Map<String, Map<String, String>> baseStoreParams,
       Optional<List<BasePath>> initialBases,
       Optional<List<String>> targetBases,
       Optional<Boolean> allowExternalBlobOutsideBases,
-      Optional<Long> blobPackFileSizeThreshold);
+      Optional<Long> blobPackFileSizeThreshold,
+      FileWriteOptions fileWriteOptions);
 
   /**
    * Creates a dataset from an FFI arrow stream.
@@ -216,6 +239,7 @@ public class Dataset implements Closeable {
    * @param dataStorageVersion data storage version
    * @param enableV2ManifestPaths whether to enable v2 manifest paths
    * @param storageOptions storage options
+   * @param baseStoreParams runtime-only object store parameters keyed by base path URI
    * @param initialBases initial bases
    * @param targetBases target bases
    * @param namespaceClient optional namespace client for managed versioning and credential refresh
@@ -234,10 +258,12 @@ public class Dataset implements Closeable {
       Optional<String> dataStorageVersion,
       Optional<Boolean> enableV2ManifestPaths,
       Map<String, String> storageOptions,
+      Map<String, Map<String, String>> baseStoreParams,
       Optional<List<BasePath>> initialBases,
       Optional<List<String>> targetBases,
       Optional<Boolean> allowExternalBlobOutsideBases,
       Optional<Long> blobPackFileSizeThreshold,
+      FileWriteOptions fileWriteOptions,
       LanceNamespace namespaceClient,
       List<String> tableId,
       boolean namespaceClientManagedVersioning);
@@ -285,10 +311,12 @@ public class Dataset implements Closeable {
             params.getDataStorageVersion(),
             params.getEnableV2ManifestPaths(),
             params.getStorageOptions(),
+            params.getBaseStoreParams(),
             params.getInitialBases(),
             params.getTargetBases(),
             params.getAllowExternalBlobOutsideBases(),
             params.getBlobPackFileSizeThreshold(),
+            params.getFileWriteOptions(),
             namespaceClient,
             tableId,
             namespaceClientManagedVersioning);
@@ -306,7 +334,12 @@ public class Dataset implements Closeable {
   @Deprecated
   public static Dataset open(String path) {
     return open(
-        new RootAllocator(Long.MAX_VALUE), true, path, new ReadOptions.Builder().build(), null);
+        new RootAllocator(Long.MAX_VALUE),
+        true,
+        path,
+        new ReadOptions.Builder().build(),
+        new HashMap<>(),
+        null);
   }
 
   /**
@@ -320,7 +353,8 @@ public class Dataset implements Closeable {
    */
   @Deprecated
   public static Dataset open(String path, ReadOptions options) {
-    return open(new RootAllocator(Long.MAX_VALUE), true, path, options, null);
+    return open(
+        new RootAllocator(Long.MAX_VALUE), true, path, options, options.getBaseStoreParams(), null);
   }
 
   /**
@@ -349,7 +383,7 @@ public class Dataset implements Closeable {
    */
   @Deprecated
   public static Dataset open(BufferAllocator allocator, String path, ReadOptions options) {
-    return open(allocator, false, path, options, null);
+    return open(allocator, false, path, options, options.getBaseStoreParams(), null);
   }
 
   /**
@@ -365,7 +399,27 @@ public class Dataset implements Closeable {
       String path,
       ReadOptions options,
       Session session) {
-    return open(allocator, selfManagedAllocator, path, options, session, null, null, false);
+    return open(
+        allocator, selfManagedAllocator, path, options, options.getBaseStoreParams(), session);
+  }
+
+  static Dataset open(
+      BufferAllocator allocator,
+      boolean selfManagedAllocator,
+      String path,
+      ReadOptions options,
+      Map<String, Map<String, String>> baseStoreParams,
+      Session session) {
+    return open(
+        allocator,
+        selfManagedAllocator,
+        path,
+        options,
+        baseStoreParams,
+        session,
+        null,
+        null,
+        false);
   }
 
   /**
@@ -388,6 +442,7 @@ public class Dataset implements Closeable {
       boolean selfManagedAllocator,
       String path,
       ReadOptions options,
+      Map<String, Map<String, String>> baseStoreParams,
       Session session,
       LanceNamespace namespaceClient,
       List<String> tableId,
@@ -406,10 +461,12 @@ public class Dataset implements Closeable {
         openNative(
             path,
             options.getVersion(),
+            options.getRef(),
             options.getBlockSize(),
             options.getIndexCacheSizeBytes(),
             options.getMetadataCacheSizeBytes(),
             options.getStorageOptions(),
+            baseStoreParams,
             options.getSerializedManifest(),
             sessionHandle,
             namespaceClient,
@@ -429,15 +486,58 @@ public class Dataset implements Closeable {
   private static native Dataset openNative(
       String path,
       Optional<Long> version,
+      Optional<Ref> ref,
       Optional<Integer> blockSize,
       long indexCacheSize,
       long metadataCacheSizeBytes,
       Map<String, String> storageOptions,
+      Map<String, Map<String, String>> baseStoreParams,
       Optional<ByteBuffer> serializedManifest,
       long sessionHandle,
       LanceNamespace namespaceClient,
       List<String> tableId,
       boolean namespaceClientManagedVersioning);
+
+  /**
+   * List manifest locations without reading or deserializing the manifest contents.
+   *
+   * <p>The returned locations are not guaranteed to be ordered. This operation may list and
+   * materialize the full manifest history.
+   *
+   * <p>This method is for datasets whose committed manifests can be listed authoritatively from the
+   * object store. Namespace-managed tables, external version stores such as {@code s3+ddb}, and
+   * tables using a custom commit handler are not supported.
+   *
+   * @param uri dataset URI
+   * @return manifest locations
+   */
+  public static List<ManifestLocation> listManifestLocations(String uri) {
+    return listManifestLocations(uri, new HashMap<>());
+  }
+
+  /**
+   * List manifest locations without reading or deserializing the manifest contents.
+   *
+   * <p>The returned locations are not guaranteed to be ordered. This operation may list and
+   * materialize the full manifest history.
+   *
+   * <p>This method is for datasets whose committed manifests can be listed authoritatively from the
+   * object store. Namespace-managed tables, external version stores such as {@code s3+ddb}, and
+   * tables using a custom commit handler are not supported.
+   *
+   * @param uri dataset URI
+   * @param storageOptions object-store credentials and connection options
+   * @return manifest locations
+   */
+  public static List<ManifestLocation> listManifestLocations(
+      String uri, Map<String, String> storageOptions) {
+    Preconditions.checkNotNull(uri, "uri must not be null");
+    Preconditions.checkNotNull(storageOptions, "storageOptions must not be null");
+    return listManifestLocationsNative(uri, storageOptions);
+  }
+
+  private static native List<ManifestLocation> listManifestLocationsNative(
+      String uri, Map<String, String> storageOptions);
 
   /**
    * Creates a builder for opening a dataset.
@@ -580,10 +680,19 @@ public class Dataset implements Closeable {
   }
 
   /**
-   * Drop a Dataset.
+   * Drop a Dataset, deleting everything under {@code path} recursively.
+   *
+   * <p>To limit the damage a mistyped or misconfigured path can do, {@code path} must be a dataset
+   * root, meaning it holds a manifest that can be read, or a namespace declare/deregister marker.
+   * Anything else throws {@link IllegalArgumentException}, including a path that holds only data
+   * files or only unreadable manifests: such leftovers need an explicit storage-level delete.
+   *
+   * <p>Note that a path which passes this check is deleted in full, including any unmanaged files
+   * kept next to the dataset.
    *
    * @param path The file path of the dataset
    * @param storageOptions Storage options
+   * @throws IllegalArgumentException if {@code path} is not a Lance dataset root
    */
   public static native void drop(String path, Map<String, String> storageOptions);
 
@@ -691,11 +800,31 @@ public class Dataset implements Closeable {
   public void alterColumns(List<ColumnAlteration> columnAlterations) {
     try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      nativeAlterColumns(columnAlterations);
+      // Cast target types are carried across the FFI boundary through the Arrow C Data
+      // Interface rather than ArrowType#toString(), which does not round-trip reliably on
+      // the native side (parameterized types such as Int(64, true) fail to parse and the
+      // cast would otherwise be silently dropped). One field is exported per alteration that
+      // requests a type change, in the same order as {@code columnAlterations}.
+      List<Field> castFields = new ArrayList<>();
+      int castIndex = 0;
+      for (ColumnAlteration alteration : columnAlterations) {
+        if (alteration.getDataType().isPresent()) {
+          castFields.add(new Field("f" + castIndex++, castFieldType(alteration), null));
+        }
+      }
+      try (ArrowSchema castSchema = ArrowSchema.allocateNew(allocator)) {
+        Data.exportSchema(allocator, new Schema(castFields), null, castSchema);
+        nativeAlterColumns(columnAlterations, castSchema.memoryAddress());
+      }
     }
   }
 
-  private native void nativeAlterColumns(List<ColumnAlteration> columnAlterations);
+  private static FieldType castFieldType(ColumnAlteration alteration) {
+    boolean nullable = alteration.getNullable().orElse(true);
+    return new FieldType(nullable, alteration.getDataType().get(), null);
+  }
+
+  private native void nativeAlterColumns(List<ColumnAlteration> columnAlterations, long castAddr);
 
   /**
    * Create a new Dataset Scanner.
@@ -755,6 +884,35 @@ public class Dataset implements Closeable {
   }
 
   private native byte[] nativeTake(List<Long> indices, List<String> columns);
+
+  /**
+   * Select rows of data by their physical row IDs.
+   *
+   * @param rowIds the physical row IDs to retrieve (from the _rowid column)
+   * @param columns the columns to include in the result
+   * @return an ArrowReader containing the requested rows in input order
+   * @throws IOException if a row ID does not exist or an I/O error occurs
+   */
+  public ArrowReader takeRows(List<Long> rowIds, List<String> columns) throws IOException {
+    Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+    Preconditions.checkArgument(
+        rowIds != null && !rowIds.isEmpty(), "rowIds cannot be null or empty");
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      byte[] arrowData = nativeTakeRows(rowIds, columns);
+      ByteArrayInputStream byteArrayInputStream = new ByteArrayInputStream(arrowData);
+      ReadableByteChannel readChannel = Channels.newChannel(byteArrayInputStream);
+      return new ArrowStreamReader(readChannel, allocator) {
+        @Override
+        public void close() throws IOException {
+          super.close();
+          readChannel.close();
+          byteArrayInputStream.close();
+        }
+      };
+    }
+  }
+
+  private native byte[] nativeTakeRows(List<Long> rowIds, List<String> columns);
 
   /**
    * Randomly sample n rows from the dataset.
@@ -886,10 +1044,27 @@ public class Dataset implements Closeable {
   private native List<Version> nativeListVersions();
 
   /**
+   * Get the number of versions in the current version history.
+   *
+   * <p>Unlike {@link #listVersions()}, this method does not read or deserialize every manifest.
+   * Detached versions are not included.
+   *
+   * @return the number of versions
+   */
+  public long getVersionCount() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeGetVersionCount();
+    }
+  }
+
+  private native long nativeGetVersionCount();
+
+  /**
    * @return the latest version of the dataset.
    */
   public long latestVersion() {
-    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
       return nativeGetLatestVersionId();
     }
@@ -954,13 +1129,7 @@ public class Dataset implements Closeable {
     Preconditions.checkArgument(version > 0, "version number must be greater than 0");
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      Dataset newDataset = nativeCheckoutVersion(version);
-      if (selfManagedAllocator) {
-        newDataset.allocator = new RootAllocator(Long.MAX_VALUE);
-      } else {
-        newDataset.allocator = allocator;
-      }
-      return newDataset;
+      return initializeCheckoutDataset(nativeCheckoutVersion(version));
     }
   }
 
@@ -977,17 +1146,22 @@ public class Dataset implements Closeable {
     Preconditions.checkArgument(tag != null, "Tag can not be null");
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      Dataset newDataset = nativeCheckoutTag(tag);
-      if (selfManagedAllocator) {
-        newDataset.allocator = new RootAllocator(Long.MAX_VALUE);
-      } else {
-        newDataset.allocator = allocator;
-      }
-      return newDataset;
+      return initializeCheckoutDataset(nativeCheckoutTag(tag));
     }
   }
 
   private native Dataset nativeCheckoutTag(String tag);
+
+  private Dataset initializeCheckoutDataset(Dataset checkedOutDataset) {
+    if (selfManagedAllocator) {
+      checkedOutDataset.allocator = new RootAllocator(Long.MAX_VALUE);
+    } else {
+      checkedOutDataset.allocator = allocator;
+    }
+    checkedOutDataset.session = Session.fromHandle(checkedOutDataset.nativeGetSessionHandle());
+    checkedOutDataset.ownsSession = true;
+    return checkedOutDataset;
+  }
 
   /**
    * Restore the currently checked out version of the dataset as the latest version. This operation
@@ -1030,22 +1204,93 @@ public class Dataset implements Closeable {
   /**
    * Creates a new index on the dataset.
    *
+   * <p>Concurrent {@link #createIndex} / {@link #mergeIndexMetadata} calls on the same Dataset
+   * handle are serialized.
+   *
    * @param options options for building index
    * @return the metadata of the created index
    */
   public Index createIndex(IndexOptions options) {
+    Preconditions.checkNotNull(options, "options cannot be null");
+    return createIndexInternal(options, null);
+  }
+
+  /**
+   * Creates a new index on the dataset while reporting stage-level progress.
+   *
+   * <p>Stage names, work units, and whether a total is available depend on the index type. The
+   * callback must be thread-safe because Lance may invoke it concurrently from native runtime
+   * threads. Callbacks may re-enter read-only methods on this Dataset. Conflicting write re-entry
+   * from a callback is rejected; unrelated concurrent callers keep their normal wait behavior.
+   * Concurrent {@link #createIndex} / {@link #mergeIndexMetadata} calls on the same Dataset handle
+   * are serialized.
+   *
+   * <pre>{@code
+   * Index index = dataset.createIndex(options, new IndexBuildProgress() {
+   *   public void stageStart(String stage, Optional<Long> total, String unit) { }
+   *   public void stageProgress(String stage, long completed) { }
+   *   public void stageComplete(String stage) { }
+   * });
+   * }</pre>
+   *
+   * @param options options for building index
+   * @param progress thread-safe progress callback
+   * @return the metadata of the created index
+   */
+  public Index createIndex(IndexOptions options, IndexBuildProgress progress) {
+    Preconditions.checkNotNull(options, "options cannot be null");
+    Preconditions.checkNotNull(progress, "progress cannot be null");
+    return createIndexInternal(options, progress);
+  }
+
+  private Index createIndexInternal(IndexOptions options, IndexBuildProgress progress) {
+    if (ContextIndexBuildProgress.isActive(this)) {
+      throw new IllegalStateException("Dataset is busy in an index progress callback");
+    }
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      return nativeCreateIndex(
-          options.getColumns(),
-          options.getIndexType().getValue(),
-          options.getIndexName(),
-          options.getIndexParams(),
-          options.isReplace(),
-          options.isTrain(),
-          options.getFragmentIds(),
-          options.getIndexUUID(),
-          options.getPreprocessedData().map(ArrowArrayStream::memoryAddress));
+      acquireIndexBuildLock();
+      try {
+        if (progress == null) {
+          return nativeCreateIndex(
+              options.getColumns(),
+              options.getIndexType().getValue(),
+              options.getIndexName(),
+              options.getIndexParams(),
+              options.isReplace(),
+              options.isTrain(),
+              options.getFragmentIds(),
+              options.getIndexUUID(),
+              options.getPreprocessedData().map(ArrowArrayStream::memoryAddress));
+        }
+        return nativeCreateIndexWithProgress(
+            options.getColumns(),
+            options.getIndexType().getValue(),
+            options.getIndexName(),
+            options.getIndexParams(),
+            options.isReplace(),
+            options.isTrain(),
+            options.getFragmentIds(),
+            options.getIndexUUID(),
+            options.getPreprocessedData().map(ArrowArrayStream::memoryAddress),
+            new ContextIndexBuildProgress(this, progress));
+      } finally {
+        indexBuildLock.unlock();
+      }
+    }
+  }
+
+  private void acquireIndexBuildLock() {
+    if (ContextIndexBuildProgress.isCallbackActive()) {
+      // An outer index build waits for its callback to return, so waiting here could create a
+      // cross-Dataset lock cycle between two concurrent builds.
+      if (!indexBuildLock.tryLock()) {
+        throw new IllegalStateException(
+            "Dataset is busy with an index build and cannot start another build "
+                + "from an index progress callback");
+      }
+    } else {
+      indexBuildLock.lock();
     }
   }
 
@@ -1059,6 +1304,18 @@ public class Dataset implements Closeable {
       Optional<List<Integer>> fragments,
       Optional<String> indexUUID,
       Optional<Long> arrowStreamMemoryAddress);
+
+  private native Index nativeCreateIndexWithProgress(
+      List<String> columns,
+      int indexTypeCode,
+      Optional<String> name,
+      IndexParams params,
+      boolean replace,
+      boolean train,
+      Optional<List<Integer>> fragments,
+      Optional<String> indexUUID,
+      Optional<Long> arrowStreamMemoryAddress,
+      IndexBuildProgress progress);
 
   /**
    * Drop an index by name.
@@ -1077,49 +1334,65 @@ public class Dataset implements Closeable {
 
   public void mergeIndexMetadata(
       String indexUUID, IndexType indexType, Optional<Integer> batchReadHead) {
-    innerMergeIndexMetadata(indexUUID, indexType.getValue(), batchReadHead);
+    mergeIndexMetadataInternal(indexUUID, indexType, batchReadHead, null);
   }
 
   private native void innerMergeIndexMetadata(
       String indexUUID, int indexType, Optional<Integer> batchReadHead);
 
   /**
-   * Build physical vector index segments from previously-created fragment-level index outputs.
+   * Merge distributed index metadata while reporting stage-level progress.
    *
-   * @param segments segment metadata returned by {@link #createIndex(IndexOptions)} when
-   *     fragmentIds are provided
-   * @param indexType concrete index type for the staged segments
-   * @param targetSegmentBytes optional size target for merged physical segments
-   * @return built physical segment metadata
+   * <p>Callback re-entry semantics match {@link #createIndex(IndexOptions, IndexBuildProgress)}:
+   * read-only Dataset methods are allowed, conflicting write re-entry is rejected, and concurrent
+   * create/merge builds on this handle are serialized.
+   *
+   * @param indexUUID shared UUID used by the distributed index parts
+   * @param indexType type of index metadata to merge
+   * @param batchReadHead optional limit for metadata read concurrency
+   * @param progress thread-safe progress callback
    */
-  public List<Index> buildIndexSegments(
-      List<Index> segments, IndexType indexType, Optional<Long> targetSegmentBytes) {
-    Preconditions.checkNotNull(segments, "segments cannot be null");
-    Preconditions.checkArgument(!segments.isEmpty(), "segments cannot be empty");
-    Preconditions.checkNotNull(indexType, "indexType cannot be null");
-    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+  public void mergeIndexMetadata(
+      String indexUUID,
+      IndexType indexType,
+      Optional<Integer> batchReadHead,
+      IndexBuildProgress progress) {
+    Preconditions.checkNotNull(progress, "progress cannot be null");
+    mergeIndexMetadataInternal(indexUUID, indexType, batchReadHead, progress);
+  }
+
+  private void mergeIndexMetadataInternal(
+      String indexUUID,
+      IndexType indexType,
+      Optional<Integer> batchReadHead,
+      IndexBuildProgress progress) {
+    if (ContextIndexBuildProgress.isActive(this)) {
+      throw new IllegalStateException("Dataset is busy in an index progress callback");
+    }
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      return nativeBuildIndexSegments(segments, indexType.getValue(), targetSegmentBytes);
+      acquireIndexBuildLock();
+      try {
+        if (progress == null) {
+          innerMergeIndexMetadata(indexUUID, indexType.getValue(), batchReadHead);
+        } else {
+          innerMergeIndexMetadataWithProgress(
+              indexUUID,
+              indexType.getValue(),
+              batchReadHead,
+              new ContextIndexBuildProgress(this, progress));
+        }
+      } finally {
+        indexBuildLock.unlock();
+      }
     }
   }
 
-  /**
-   * Build physical vector index segments from previously-created fragment-level index outputs.
-   *
-   * @param segments segment metadata returned by {@link #createIndex(IndexOptions)} when
-   *     fragmentIds are provided
-   * @param targetSegmentBytes optional size target for merged physical segments
-   * @return built physical segment metadata
-   */
-  @Deprecated
-  public List<Index> buildIndexSegments(List<Index> segments, Optional<Long> targetSegmentBytes) {
-    throw new IllegalArgumentException(
-        "buildIndexSegments now requires an explicit index type; call "
-            + "buildIndexSegments(segments, indexType, targetSegmentBytes)");
-  }
-
-  private native List<Index> nativeBuildIndexSegments(
-      List<Index> segments, int indexType, Optional<Long> targetSegmentBytes);
+  private native void innerMergeIndexMetadataWithProgress(
+      String indexUUID,
+      int indexType,
+      Optional<Integer> batchReadHead,
+      IndexBuildProgress progress);
 
   /** Merge one caller-defined group of existing uncommitted vector index segments. */
   public Index mergeExistingIndexSegments(List<Index> segments) {
@@ -1212,6 +1485,10 @@ public class Dataset implements Closeable {
    * counts matching row addresses, which is more efficient than scanning when the index covers the
    * filter column.
    *
+   * <p>Planning is pinned to {@code indexName}. A filter that cannot be answered by that scalar
+   * index is rejected instead of scanning the table or selecting another index. Deleted rows are
+   * excluded.
+   *
    * @param indexName the name of the scalar index to use
    * @param filter the filter expression (e.g., "column = 5")
    * @param fragmentIds optional list of fragment IDs to restrict the count to
@@ -1229,8 +1506,57 @@ public class Dataset implements Closeable {
     }
   }
 
+  /**
+   * Count rows matching a filter using explicit physical segments of a scalar index.
+   *
+   * <p>Only {@code segmentUuids} are opened. Their current fragment coverage defines the count
+   * scope: matching deleted rows inside that scope are excluded, and rows outside it are not
+   * counted. When {@code fragmentIds} is omitted, the scope is derived from that coverage. When it
+   * is present, its set must equal the coverage; order does not matter. A mismatch is rejected with
+   * an error that reports both sets.
+   *
+   * <p>The selection is accepted only when it includes every segment that contributes to that
+   * coverage. After fragment reuse, one source segment can advertise every destination fragment
+   * while still depending on its siblings. An incomplete selection is rejected, and the error names
+   * the missing segment UUIDs. A segment whose coverage does not overlap the selection can be
+   * queried alone.
+   *
+   * <p>An empty segment list, duplicate segment UUIDs, an unknown UUID, a UUID from a different
+   * index, or a segment without fragment coverage is rejected. The existing three-argument method
+   * remains available and does not take a segment list.
+   *
+   * @param indexName the logical scalar index name that every selected segment must belong to
+   * @param filter the filter expression (e.g., "column = 5")
+   * @param segmentUuids physical segment UUIDs to open; must be non-empty and contain no duplicates
+   * @param fragmentIds optional fragment IDs that must match the selected segments' current
+   *     coverage
+   * @return count of matching rows in the selected segment scope
+   */
+  public long countIndexedRows(
+      String indexName,
+      String filter,
+      List<UUID> segmentUuids,
+      Optional<List<Integer>> fragmentIds) {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      Preconditions.checkArgument(
+          indexName != null && !indexName.isEmpty(), "indexName cannot be null or empty");
+      Preconditions.checkArgument(
+          filter != null && !filter.isEmpty(), "filter cannot be null or empty");
+      Preconditions.checkNotNull(segmentUuids, "segmentUuids cannot be null");
+      Preconditions.checkArgument(!segmentUuids.isEmpty(), "segmentUuids cannot be empty");
+      return nativeCountIndexedRowsWithSegments(indexName, filter, segmentUuids, fragmentIds);
+    }
+  }
+
   private native long nativeCountIndexedRows(
       String indexName, String filter, Optional<List<Integer>> fragmentIds);
+
+  private native long nativeCountIndexedRowsWithSegments(
+      String indexName,
+      String filter,
+      List<UUID> segmentUuids,
+      Optional<List<Integer>> fragmentIds);
 
   /**
    * Calculate the size of the dataset.
@@ -1270,6 +1596,40 @@ public class Dataset implements Closeable {
   }
 
   private native List<FragmentMetadata> getFragmentsNative();
+
+  /**
+   * Returns the storage bases registered by the current manifest.
+   *
+   * <p>Files without a base id resolve against this dataset's own URI. Files with a base id resolve
+   * against the matching entry in this list.
+   */
+  public List<BasePath> getBasePaths() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeGetBasePaths();
+    }
+  }
+
+  private native List<BasePath> nativeGetBasePaths();
+
+  /**
+   * Get per-fragment statistics for all fragments in this dataset version.
+   *
+   * <p>Unlike {@link #getFragments()}, this is a metadata-only bulk operation: no per-fragment Java
+   * objects are materialized, and native code fills the returned primitive arrays directly. This
+   * makes it suitable for planning over datasets with a very large number of fragments. Row counts
+   * match {@link FragmentMetadata#getNumRows()} (physical rows minus deleted rows).
+   *
+   * @return per-fragment statistics as parallel arrays, in manifest order
+   */
+  public FragmentStatistics getFragmentStatistics() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeGetFragmentStatistics();
+    }
+  }
+
+  private native FragmentStatistics nativeGetFragmentStatistics();
 
   /**
    * Gets the arrow schema of the dataset.
@@ -1460,6 +1820,22 @@ public class Dataset implements Closeable {
   private native boolean nativeHasStableRowIds();
 
   /**
+   * Get the library version that wrote the current manifest.
+   *
+   * <p>Older manifests may not contain writer version metadata.
+   *
+   * @return the current manifest writer version, or empty if unavailable
+   */
+  public Optional<WriterVersion> getWriterVersion() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return Optional.ofNullable(nativeGetWriterVersion());
+    }
+  }
+
+  private native WriterVersion nativeGetWriterVersion();
+
+  /**
    * Get the Lance file format version of this dataset.
    *
    * <p>The returned string will be one of: "0.1" (legacy), "2.0", "2.1", or "2.2".
@@ -1511,6 +1887,9 @@ public class Dataset implements Closeable {
    */
   @Deprecated
   public void updateConfig(Map<String, String> tableConfig) {
+    if (ContextIndexBuildProgress.isActive(this)) {
+      throw new IllegalStateException("Dataset is busy in an index progress callback");
+    }
     UpdateMap configUpdate = UpdateMap.builder().updates(tableConfig).replace(true).build();
 
     UpdateConfig operation = UpdateConfig.builder().configUpdates(configUpdate).build();
@@ -1527,6 +1906,9 @@ public class Dataset implements Closeable {
    */
   @Deprecated
   public void deleteConfigKeys(Set<String> deleteKeys) {
+    if (ContextIndexBuildProgress.isActive(this)) {
+      throw new IllegalStateException("Dataset is busy in an index progress callback");
+    }
     Map<String, String> deleteMap = new HashMap<>();
     deleteKeys.forEach(key -> deleteMap.put(key, null));
     UpdateMap configUpdate = UpdateMap.builder().updates(deleteMap).replace(false).build();
@@ -1552,6 +1934,26 @@ public class Dataset implements Closeable {
 
     // Prevent the new dataset from closing the handle when it gets GC'd
     newDataset.nativeDatasetHandle = 0;
+  }
+
+  /**
+   * Acquires a shared read lock that pins the native dataset handle, blocking a concurrent {@link
+   * #close()} until the lock is released.
+   *
+   * <p>Any code that passes this {@link Dataset} into a native method must hold this lock for the
+   * whole native call; otherwise {@code close()} can release the native dataset mid-call and crash
+   * the JVM. The lock is reentrant and intended for try-with-resources use.
+   *
+   * @return the acquired read lock
+   * @throws IllegalArgumentException if the dataset is already closed
+   */
+  public LockManager.ReadLock acquireReadLock() {
+    LockManager.ReadLock readLock = lockManager.acquireReadLock();
+    if (nativeDatasetHandle == 0) {
+      readLock.close();
+      throw new IllegalArgumentException("Dataset is closed");
+    }
+    return readLock;
   }
 
   /**
@@ -1588,12 +1990,55 @@ public class Dataset implements Closeable {
 
   private native List<BlobFile> nativeTakeBlobsByIndices(List<Long> rowIndices, String column);
 
+  private static void checkReadBufferSize(long bufferSize) {
+    if (bufferSize < 0) {
+      throw new IllegalArgumentException("bufferSize must be non-negative");
+    }
+  }
+
+  static void setBlobReadBufferSize(List<BlobFile> blobs, long bufferSize) throws IOException {
+    try {
+      for (BlobFile blob : blobs) {
+        if (blob != null) {
+          blob.setReadBufferSize(bufferSize);
+        }
+      }
+    } catch (IOException | RuntimeException e) {
+      for (BlobFile blob : blobs) {
+        if (blob != null) {
+          try {
+            blob.close();
+          } catch (IOException | RuntimeException closeError) {
+            e.addSuppressed(closeError);
+          }
+        }
+      }
+      throw e;
+    }
+  }
+
   /**
-   * Open blob files for given row ids on a blob column. Names and semantics align with Rust/Python.
+   * Open {@link BlobFile} handles for given row IDs on a blob column. Names and semantics align
+   * with Rust/Python.
    *
-   * @param rowIds stable row ids (row addresses)
+   * <p>Pass logical row IDs read from {@code _rowid}, not physical row addresses from {@code
+   * _rowaddr}.
+   *
+   * <pre>{@code
+   * long rowId = 42L; // Example value from the _rowid column.
+   * List<BlobFile> blobs = dataset.takeBlobs(List.of(rowId), "images");
+   * for (BlobFile blob : blobs) {
+   *   if (blob != null) {
+   *     try (BlobFile file = blob) {
+   *       byte[] data = file.read();
+   *     }
+   *   }
+   * }
+   * }</pre>
+   *
+   * @param rowIds logical row IDs from the {@code _rowid} column
    * @param column blob column name
-   * @return list of BlobFile objects
+   * @return one {@link BlobFile} per row ID; null blob values are represented by null elements
    */
   public List<BlobFile> takeBlobs(List<Long> rowIds, String column) {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
@@ -1607,11 +2052,35 @@ public class Dataset implements Closeable {
   }
 
   /**
-   * Open blob files for given row indices on a blob column.
+   * Open {@link BlobFile} handles and set sequential read-ahead size.
+   *
+   * @param bufferSize sequential read-ahead size in bytes. {@code 0} disables read-ahead
+   */
+  public List<BlobFile> takeBlobs(List<Long> rowIds, String column, long bufferSize)
+      throws IOException {
+    checkReadBufferSize(bufferSize);
+    List<BlobFile> blobs = takeBlobs(rowIds, column);
+    setBlobReadBufferSize(blobs, bufferSize);
+    return blobs;
+  }
+
+  /**
+   * Open {@link BlobFile} handles for given row indices on a blob column.
+   *
+   * <pre>{@code
+   * List<BlobFile> blobs = dataset.takeBlobsByIndices(List.of(0L), "images");
+   * for (BlobFile blob : blobs) {
+   *   if (blob != null) {
+   *     try (BlobFile file = blob) {
+   *       byte[] data = file.read();
+   *     }
+   *   }
+   * }
+   * }</pre>
    *
    * @param rowIndices row offsets within dataset
    * @param column blob column name
-   * @return list of BlobFile objects
+   * @return one {@link BlobFile} per row index; null blob values are represented by null elements
    */
   public List<BlobFile> takeBlobsByIndices(List<Long> rowIndices, String column) {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
@@ -1622,6 +2091,19 @@ public class Dataset implements Closeable {
           column != null && !column.isEmpty(), "column cannot be null or empty");
       return nativeTakeBlobsByIndices(rowIndices, column);
     }
+  }
+
+  /**
+   * Open {@link BlobFile} handles by row index and set sequential read-ahead size.
+   *
+   * @param bufferSize sequential read-ahead size in bytes. {@code 0} disables read-ahead
+   */
+  public List<BlobFile> takeBlobsByIndices(List<Long> rowIndices, String column, long bufferSize)
+      throws IOException {
+    checkReadBufferSize(bufferSize);
+    List<BlobFile> blobs = takeBlobsByIndices(rowIndices, column);
+    setBlobReadBufferSize(blobs, bufferSize);
+    return blobs;
   }
 
   /**
@@ -1659,10 +2141,12 @@ public class Dataset implements Closeable {
 
   /**
    * Create a branch at a specified version. The returned Dataset points to the created branch's
-   * initial version.
+   * initial version. The branch name {@code "main"} is reserved for the default branch and cannot
+   * be used as a new branch name.
    *
    * @param branch the branch name to create
-   * @param ref the reference to create branch from
+   * @param ref the reference to create branch from. In reference contexts, {@code "main"} is an
+   *     alias for the default branch.
    * @return a new Dataset of the branch
    */
   public Dataset createBranch(String branch, Ref ref) {
@@ -1672,10 +2156,12 @@ public class Dataset implements Closeable {
 
   /**
    * Create a branch at a specified version. The returned Dataset points to the created branch's
-   * initial version.
+   * initial version. The branch name {@code "main"} is reserved for the default branch and cannot
+   * be used as a new branch name.
    *
    * @param branch the branch name to create
-   * @param ref the reference to create branch from
+   * @param ref the reference to create branch from. In reference contexts, {@code "main"} is an
+   *     alias for the default branch.
    * @param storageOptions the storage options to create branch with
    * @return a new Dataset of the branch
    */
@@ -1696,8 +2182,9 @@ public class Dataset implements Closeable {
   }
 
   /**
-   * Checkout using a unified {@link Ref} which can be a tag, the latest version on main/branch or a
-   * specified (branch_name, version_number).
+   * Checkout using a unified {@link Ref} which can be a tag, the latest version on the default
+   * branch or a named branch, or a specified (branch_name, version_number). In reference contexts,
+   * {@code "main"} is an alias for the default branch.
    *
    * @param ref the checkout reference
    * @return a new Dataset instance checked out to the specified reference
@@ -1706,13 +2193,7 @@ public class Dataset implements Closeable {
     Preconditions.checkNotNull(ref);
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      Dataset newDataset = nativeCheckout(ref);
-      if (selfManagedAllocator) {
-        newDataset.allocator = new RootAllocator(Long.MAX_VALUE);
-      } else {
-        newDataset.allocator = allocator;
-      }
-      return newDataset;
+      return initializeCheckoutDataset(nativeCheckout(ref));
     }
   }
 
@@ -1734,7 +2215,7 @@ public class Dataset implements Closeable {
   public class Tags {
 
     /**
-     * Create a new tag on main branch. This is left for compatibility. We should use {@link
+     * Create a new tag on the default branch. This is left for compatibility. We should use {@link
      * #create(String, Ref)} instead.
      *
      * @param tag the tag name
@@ -1749,7 +2230,8 @@ public class Dataset implements Closeable {
      * Create a new tag on a specified branch.
      *
      * @param tag the tag name
-     * @param ref the referenced version to tag
+     * @param ref the referenced version to tag. In reference contexts, {@code "main"} is an alias
+     *     for the default branch.
      */
     public void create(String tag, Ref ref) {
       Preconditions.checkArgument(tag != null, "Tag name cannot be null");
@@ -1766,6 +2248,8 @@ public class Dataset implements Closeable {
      *
      * @param tag the name of the tag to create
      * @param versionNumber the version number (or commit reference) to associate with the tag
+     * @param targetBranch the branch to tag. In reference contexts, {@code "main"} is an alias for
+     *     the default branch.
      */
     @Deprecated
     public void create(String tag, long versionNumber, String targetBranch) {
@@ -1785,11 +2269,11 @@ public class Dataset implements Closeable {
     }
 
     /**
-     * Update a tag to a new version_number on main. This is left for compatibility. We should use
-     * {@link #update(String, Ref)} instead.
+     * Update a tag to a new version_number on the default branch. This is left for compatibility.
+     * We should use {@link #update(String, Ref)} instead.
      *
      * @param tag the tag name
-     * @param versionNumber the versionNumber on main.
+     * @param versionNumber the versionNumber on the default branch.
      */
     public void update(String tag, long versionNumber) {
       Preconditions.checkArgument(versionNumber > 0, "version_number must be greater than 0");
@@ -1800,7 +2284,8 @@ public class Dataset implements Closeable {
      * Update a tag to a new reference.
      *
      * @param tag the tag name
-     * @param ref the referenced version to tag
+     * @param ref the referenced version to tag. In reference contexts, {@code "main"} is an alias
+     *     for the default branch.
      */
     public void update(String tag, Ref ref) {
       Preconditions.checkArgument(tag != null, "tag cannot be null");
@@ -1852,7 +2337,8 @@ public class Dataset implements Closeable {
     /**
      * Delete a branch and its metadata.
      *
-     * @param branchName the branch to delete
+     * @param branchName the branch to delete. {@code "main"} is reserved for the default branch and
+     *     cannot be deleted as a named branch.
      */
     public void delete(String branchName) {
       try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
@@ -1960,6 +2446,99 @@ public class Dataset implements Closeable {
   private native MergeInsertResult nativeMergeInsert(
       MergeInsertParams mergeInsert, long arrowStreamMemoryAddress);
 
+  /**
+   * Update column values for rows matching an optional predicate.
+   *
+   * <p>This is similar to SQL's {@code UPDATE} statement: the entries of {@link
+   * UpdateParams#updates()} map target column names to SQL expressions evaluated for every row that
+   * satisfies {@link UpdateParams#whereClause()}. If no predicate is provided, every row is
+   * updated.
+   *
+   * <p>The predicate may reference dataset columns as well as the system columns {@code _rowid},
+   * {@code _rowaddr}, and {@code _rowoffset}, allowing rows to be targeted by stable row id (e.g.
+   * {@code "_rowid IN (1, 2, 3)"}).
+   *
+   * <p>This call does not mutate the current {@code Dataset} instance: it still references the
+   * pre-update version. Callers should close this {@code Dataset} and switch to {@link
+   * UpdateResult#getDataset()}, which holds the newly committed version.
+   *
+   * @param params update parameters
+   * @return UpdateResult containing the new committed Dataset and the number of rows updated.
+   */
+  public UpdateResult update(UpdateParams params) {
+    Preconditions.checkNotNull(params, "params must not be null");
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      UpdateResult result = nativeUpdate(params);
+
+      Dataset newDataset = result.getDataset();
+      if (selfManagedAllocator) {
+        newDataset.allocator = new RootAllocator(Long.MAX_VALUE);
+      } else {
+        newDataset.allocator = allocator;
+      }
+
+      return result;
+    }
+  }
+
+  private native UpdateResult nativeUpdate(UpdateParams params);
+
+  /**
+   * Initialize MemWAL on this dataset.
+   *
+   * <p>Must be called once before any call to {@link #memWalWriter}. Append-only tables may omit
+   * primary-key metadata; primary keys are only required for primary-key lookup and last-write-wins
+   * deduplication workflows.
+   *
+   * @param params MemWAL initialization parameters
+   */
+  public void initializeMemWal(InitializeMemWalParams params) {
+    Preconditions.checkNotNull(params, "params must not be null");
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      nativeInitializeMemWal(params);
+    }
+  }
+
+  private native void nativeInitializeMemWal(InitializeMemWalParams params);
+
+  /**
+   * Return the MemWAL index details for this dataset, or {@link Optional#empty()} if MemWAL has not
+   * been initialized.
+   *
+   * @return the MemWAL index details, if any
+   */
+  public Optional<MemWalIndexDetails> memWalIndexDetails() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return Optional.ofNullable(nativeMemWalIndexDetails());
+    }
+  }
+
+  private native MemWalIndexDetails nativeMemWalIndexDetails();
+
+  /**
+   * Get a {@link ShardWriter} for the specified shard.
+   *
+   * <p>{@link #initializeMemWal} must be called before using this method.
+   *
+   * @param shardId UUID string identifying the write shard
+   * @param config writer configuration; pass {@code null} to use the Lance default configuration
+   * @return a ShardWriter for the shard
+   */
+  public ShardWriter memWalWriter(String shardId, ShardWriterConfig config) {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return ShardWriter.create(this, shardId, config);
+    }
+  }
+
+  /** Get a {@link ShardWriter} for the specified shard using the Lance default configuration. */
+  public ShardWriter memWalWriter(String shardId) {
+    return memWalWriter(shardId, null);
+  }
+
   private native void nativeCreateTag(String tag, Ref ref);
 
   private native void nativeDeleteTag(String tag);
@@ -2019,17 +2598,47 @@ public class Dataset implements Closeable {
       String targetPath, Ref ref, Optional<Map<String, String>> storageOptions);
 
   /**
+   * Create a cleanup operation for the specified policy.
+   *
+   * <p>Use {@link CleanupOperation#explain()} to inspect what cleanup would remove without deleting
+   * files, or {@link CleanupOperation#execute()} to perform cleanup.
+   *
+   * @param policy cleanup policy
+   * @return cleanup operation
+   */
+  public CleanupOperation cleanup(CleanupPolicy policy) {
+    Preconditions.checkNotNull(policy, "policy cannot be null");
+    return new CleanupOperation(this, policy);
+  }
+
+  /**
    * Cleanup dataset based on a specified policy.
    *
    * @param policy cleanup policy
    * @return removal stats
    */
   public RemovalStats cleanupWithPolicy(CleanupPolicy policy) {
+    return cleanup(policy).execute();
+  }
+
+  RemovalStats executeCleanup(
+      CleanupPolicy policy, Optional<Long> deleteConcurrency, Optional<Long> deleteRateLimit) {
     try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      return nativeCleanupWithPolicy(policy);
+      return nativeCleanupWithPolicy(policy, deleteConcurrency, deleteRateLimit);
     }
   }
 
-  private native RemovalStats nativeCleanupWithPolicy(CleanupPolicy policy);
+  private native RemovalStats nativeCleanupWithPolicy(
+      CleanupPolicy policy, Optional<Long> deleteConcurrency, Optional<Long> deleteRateLimit);
+
+  CleanupExplanation explainCleanup(CleanupPolicy policy, Optional<Long> maxCandidateFiles) {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeExplainCleanupWithPolicy(policy, maxCandidateFiles);
+    }
+  }
+
+  private native CleanupExplanation nativeExplainCleanupWithPolicy(
+      CleanupPolicy policy, Optional<Long> maxCandidateFiles);
 }
