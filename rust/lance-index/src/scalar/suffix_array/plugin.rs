@@ -471,6 +471,39 @@ fn extract_token_list_bytes(
     Ok(docs)
 }
 
+/// Splits the leading segment off an accumulated corpus.
+///
+/// `doc_offsets[i]` is the end of document `i` in `bytes` and `row_ids[i]` its
+/// row. The segment ends at the last document boundary at or below `max_bytes`,
+/// or after the first document if that one alone is larger, so no document
+/// spans two segments: a match inside a split document could not be mapped back
+/// to its row, and an n-gram across the split would be lost. The remaining
+/// offsets are rebased to the start of what is left in `bytes`.
+fn split_segment(
+    bytes: &mut Vec<u8>,
+    doc_offsets: &mut Vec<u64>,
+    row_ids: &mut Vec<u64>,
+    max_bytes: usize,
+) -> (Vec<u8>, Vec<u64>, Vec<u64>) {
+    let num_docs = doc_offsets
+        .partition_point(|&o| o <= max_bytes as u64)
+        .max(1);
+    let split_point = doc_offsets[num_docs - 1];
+    let rest = bytes.split_off(split_point as usize);
+    let remaining_offsets = doc_offsets[num_docs..]
+        .iter()
+        .map(|&o| o - split_point)
+        .collect();
+    let mut segment_offsets = std::mem::replace(doc_offsets, remaining_offsets);
+    segment_offsets.truncate(num_docs);
+    let remaining_row_ids = row_ids.split_off(num_docs);
+    (
+        std::mem::replace(bytes, rest),
+        segment_offsets,
+        std::mem::replace(row_ids, remaining_row_ids),
+    )
+}
+
 #[async_trait]
 impl BasicTrainer for SuffixArrayIndexPlugin {
     fn new_training_request(
@@ -728,34 +761,15 @@ impl BasicTrainer for SuffixArrayIndexPlugin {
             total_documents += docs;
 
             // Split off complete segments as we accumulate data.
-            // When splitting, doc_offsets and row_ids need to be adjusted:
-            // offsets that fall within the split-off portion stay with that
-            // segment (rebased to 0), offsets beyond the split point remain
-            // in current_doc_offsets (rebased to the new segment start).
-            // row_ids are split at the same index as doc_offsets.
             while current_bytes.len() >= MAX_SEGMENT_BYTES {
-                let split_point = MAX_SEGMENT_BYTES as u64;
-                let rest = current_bytes.split_off(MAX_SEGMENT_BYTES);
-
-                // Partition doc_offsets: offsets <= split_point go with this segment,
-                // the rest stay in current. Note: since offsets are cumulative and
-                // sorted, we can binary search.
-                let split_idx = current_doc_offsets.partition_point(|&o| o <= split_point);
-
-                let seg_offsets: Vec<u64> = current_doc_offsets[..split_idx].to_vec();
-                let seg_row_ids: Vec<u64> = current_row_ids[..split_idx].to_vec();
-                // Rebase remaining offsets relative to the new segment start
-                let remaining_offsets: Vec<u64> = current_doc_offsets[split_idx..]
-                    .iter()
-                    .map(|&o| o - split_point)
-                    .collect();
-                let remaining_row_ids: Vec<u64> = current_row_ids[split_idx..].to_vec();
-
-                let segment = std::mem::replace(&mut current_bytes, rest);
-                current_doc_offsets = remaining_offsets;
-                current_row_ids = remaining_row_ids;
-                total_corpus_bytes += segment.len() as u64;
-                pending_segments.push((segment, seg_offsets, seg_row_ids));
+                let segment = split_segment(
+                    &mut current_bytes,
+                    &mut current_doc_offsets,
+                    &mut current_row_ids,
+                    MAX_SEGMENT_BYTES,
+                );
+                total_corpus_bytes += segment.0.len() as u64;
+                pending_segments.push(segment);
 
                 // When we have a full batch, process it immediately
                 if pending_segments.len() >= parallel_threads {
@@ -777,9 +791,6 @@ impl BasicTrainer for SuffixArrayIndexPlugin {
         if !current_bytes.is_empty() {
             total_corpus_bytes += current_bytes.len() as u64;
             pending_segments.push((current_bytes, current_doc_offsets, current_row_ids));
-        } else if !current_doc_offsets.is_empty() {
-            // Edge case: last doc ended exactly at MAX_SEGMENT_BYTES
-            // doc_offsets are empty vec (all docs were in split segment)
         }
 
         // Process any remaining segments
@@ -961,7 +972,7 @@ mod tests {
     use lance_core::utils::tempfile::TempDir;
     use lance_io::object_store::ObjectStore;
 
-    use super::{SuffixArrayBuildParams, SuffixArrayIndexPlugin};
+    use super::{SuffixArrayBuildParams, SuffixArrayIndexPlugin, split_segment};
     use crate::metrics::NoOpMetricsCollector;
     use crate::progress::NoopIndexBuildProgress;
     use crate::scalar::lance_format::LanceIndexStore;
@@ -1466,6 +1477,31 @@ mod tests {
         // `search` returns the matching documents' row addresses across segments.
         assert_eq!(search_rows(&index, b"the").await, vec![0, 1]);
         assert_eq!(search_rows(&index, b"park").await, vec![1]);
+    }
+
+    #[test]
+    fn test_split_segment_keeps_documents_whole() {
+        // Documents of 4, 6, 3 and 9 bytes (each ends with its separator).
+        let docs: [&[u8]; 4] = [b"abc\0", b"defgh\0", b"ij\0", b"klmnopqr\0"];
+        let mut bytes: Vec<u8> = docs.concat();
+        let mut doc_offsets = vec![4, 10, 13, 22];
+        let mut row_ids = vec![100, 101, 102, 103];
+
+        // The 8-byte limit falls inside "defgh": the segment ends after "abc".
+        let (seg, offsets, rows) = split_segment(&mut bytes, &mut doc_offsets, &mut row_ids, 8);
+        assert_eq!(seg, b"abc\0");
+        assert_eq!((offsets, rows), (vec![4], vec![100]));
+
+        // A limit at a document end includes that document.
+        let (seg, offsets, rows) = split_segment(&mut bytes, &mut doc_offsets, &mut row_ids, 9);
+        assert_eq!(seg, b"defgh\0ij\0");
+        assert_eq!((offsets, rows), (vec![6, 9], vec![101, 102]));
+
+        // A document larger than the limit gets a segment of its own.
+        let (seg, offsets, rows) = split_segment(&mut bytes, &mut doc_offsets, &mut row_ids, 4);
+        assert_eq!(seg, b"klmnopqr\0");
+        assert_eq!((offsets, rows), (vec![9], vec![103]));
+        assert!(bytes.is_empty() && doc_offsets.is_empty() && row_ids.is_empty());
     }
 
     #[test]
