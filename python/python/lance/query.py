@@ -373,19 +373,13 @@ class InfgramQuery:
 
     def __and__(self, other: "InfgramQuery") -> "InfgramBooleanQuery":
         if isinstance(other, InfgramBooleanQuery):
-            return InfgramBooleanQuery(
-                [(Occur.MUST, self)] + other.queries
-            )
+            return InfgramBooleanQuery([(Occur.MUST, self)] + other.queries)
         return InfgramBooleanQuery([(Occur.MUST, self), (Occur.MUST, other)])
 
     def __or__(self, other: "InfgramQuery") -> "InfgramBooleanQuery":
         if isinstance(other, InfgramBooleanQuery):
-            return InfgramBooleanQuery(
-                [(Occur.SHOULD, self)] + other.queries
-            )
-        return InfgramBooleanQuery(
-            [(Occur.SHOULD, self), (Occur.SHOULD, other)]
-        )
+            return InfgramBooleanQuery([(Occur.SHOULD, self)] + other.queries)
+        return InfgramBooleanQuery([(Occur.SHOULD, self), (Occur.SHOULD, other)])
 
     def _to_dict(self) -> dict:
         """Serialize for the PyO3 layer."""
@@ -451,6 +445,8 @@ class InfgramBooleanQuery(InfgramQuery):
             "must_not": must_not,
             "column": self.column,
         }
+
+
 @dataclass
 class MinHashQuery:
     """A MinHash similarity search over a column with a MinHash LSH index.
