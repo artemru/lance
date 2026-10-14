@@ -27,13 +27,7 @@ unsafe extern "C" {
     /// fs: extra space at end of SA (0 is enough for most cases)
     /// freq: optional output frequency table (NULL if not needed)
     /// Returns 0 on success, -1 or -2 on error.
-    fn libsais(
-        T: *const u8,
-        SA: *mut i32,
-        n: i32,
-        fs: i32,
-        freq: *mut i32,
-    ) -> i32;
+    fn libsais(T: *const u8, SA: *mut i32, n: i32, fs: i32, freq: *mut i32) -> i32;
 }
 
 /// Build a suffix array for byte data using libsais.
@@ -64,7 +58,7 @@ pub fn build_suffix_array(data: &[u8]) -> Vec<u32> {
             data.as_ptr(),
             sa.as_mut_ptr(),
             n as i32,
-            0,      // no extra space needed
+            0,                    // no extra space needed
             std::ptr::null_mut(), // no frequency table needed
         )
     };
@@ -324,7 +318,9 @@ mod tests {
         let mut data = Vec::with_capacity(100_000);
         let mut seed: u64 = 42;
         for _ in 0..100_000 {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             data.push(((seed >> 33) & 0xFF) as u8);
         }
 

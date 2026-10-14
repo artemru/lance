@@ -109,9 +109,19 @@ pub struct SuffixArraySegment {
 impl DeepSizeOf for SuffixArraySegment {
     fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
         self.tokenized.as_ref().map_or(0, |t| t.len())
-            + self.tokenized_cache.as_ref().map_or(0, |c: &super::block_cache::BlockCache| c.deep_size_of_children(context))
+            + self
+                .tokenized_cache
+                .as_ref()
+                .map_or(0, |c: &super::block_cache::BlockCache| {
+                    c.deep_size_of_children(context)
+                })
             + self.suffix_array.as_ref().map_or(0, |s| s.len())
-            + self.sa_cache.as_ref().map_or(0, |c: &super::block_cache::BlockCache| c.deep_size_of_children(context))
+            + self
+                .sa_cache
+                .as_ref()
+                .map_or(0, |c: &super::block_cache::BlockCache| {
+                    c.deep_size_of_children(context)
+                })
             + self.doc_offsets.len() * std::mem::size_of::<u64>()
             + self.row_ids.len() * std::mem::size_of::<u64>()
     }
@@ -244,13 +254,16 @@ impl DeepSizeOf for SuffixArrayIndex {
     fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
         // Count the metadata (always in memory) + bloom filters.
         // Segment data is in the cache and tracked there.
-        self.segment_metas.iter().map(|m| {
-            std::mem::size_of::<SegmentMeta>()
-                + m.bloom_filter.as_ref().map_or(0, |bf| {
-                    // Approximate: BloomFilter struct + bit array
-                    std::mem::size_of::<BloomFilter>() + bf.to_bytes().len()
-                })
-        }).sum()
+        self.segment_metas
+            .iter()
+            .map(|m| {
+                std::mem::size_of::<SegmentMeta>()
+                    + m.bloom_filter.as_ref().map_or(0, |bf| {
+                        // Approximate: BloomFilter struct + bit array
+                        std::mem::size_of::<BloomFilter>() + bf.to_bytes().len()
+                    })
+            })
+            .sum()
     }
 }
 
@@ -369,7 +382,9 @@ impl ScalarIndex for SuffixArrayIndex {
 
     fn update_criteria(&self) -> UpdateCriteria {
         // Same data as a fresh build: the rebuild in `update` needs `_rowid`.
-        UpdateCriteria::requires_old_data(TrainingCriteria::new(TrainingOrdering::None).with_row_id())
+        UpdateCriteria::requires_old_data(
+            TrainingCriteria::new(TrainingOrdering::None).with_row_id(),
+        )
     }
 
     fn derive_index_params(&self) -> Result<ScalarIndexParams> {
@@ -501,32 +516,33 @@ impl SuffixArrayIndex {
 
             // Eagerly load bloom filter (small: ~128 KB per segment)
             let bloom_filter = match store.open_index_file(&bloom_filename).await {
-                Ok(reader) => {
-                    match reader.read_record_batch(0, 1).await {
-                        Ok(batch) => {
-                            let col = batch
-                                .column(0)
-                                .as_any()
-                                .downcast_ref::<arrow_array::LargeBinaryArray>();
-                            match col.and_then(|c| BloomFilter::from_bytes(c.value(0))) {
-                                Some(bf) => {
-                                    bloom_loaded += 1;
-                                    Some(bf)
-                                }
-                                None => {
-                                    warn!(segment = i, "Bloom filter parse failed for {bloom_filename}");
-                                    bloom_parse_fail += 1;
-                                    None
-                                }
+                Ok(reader) => match reader.read_record_batch(0, 1).await {
+                    Ok(batch) => {
+                        let col = batch
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<arrow_array::LargeBinaryArray>();
+                        match col.and_then(|c| BloomFilter::from_bytes(c.value(0))) {
+                            Some(bf) => {
+                                bloom_loaded += 1;
+                                Some(bf)
+                            }
+                            None => {
+                                warn!(
+                                    segment = i,
+                                    "Bloom filter parse failed for {bloom_filename}"
+                                );
+                                bloom_parse_fail += 1;
+                                None
                             }
                         }
-                        Err(e) => {
-                            warn!(segment = i, err = %e, "Failed to read bloom batch from {bloom_filename}");
-                            bloom_parse_fail += 1;
-                            None
-                        }
                     }
-                }
+                    Err(e) => {
+                        warn!(segment = i, err = %e, "Failed to read bloom batch from {bloom_filename}");
+                        bloom_parse_fail += 1;
+                        None
+                    }
+                },
                 Err(e) => {
                     if i == 0 {
                         // Only log once to avoid spam for legacy indices
@@ -551,10 +567,7 @@ impl SuffixArrayIndex {
 
         info!(
             total_segments = metas.len(),
-            bloom_loaded,
-            bloom_missing,
-            bloom_parse_fail,
-            "SA index loaded"
+            bloom_loaded, bloom_missing, bloom_parse_fail, "SA index loaded"
         );
 
         Ok(Arc::new(Self {
@@ -594,11 +607,8 @@ impl SuffixArrayIndex {
                     size_mb = size / (1024 * 1024),
                     "Using block-cached tokenized (raw file)"
                 );
-                let cache = super::block_cache::BlockCache::new(
-                    store_arc.clone(),
-                    raw_tok_name,
-                    size,
-                );
+                let cache =
+                    super::block_cache::BlockCache::new(store_arc.clone(), raw_tok_name, size);
                 (None, Some(cache))
             }
             Err(_) => {
@@ -637,11 +647,8 @@ impl SuffixArrayIndex {
                     size_mb = size / (1024 * 1024),
                     "Using block-cached suffix array (raw file)"
                 );
-                let cache = super::block_cache::BlockCache::new(
-                    store_arc.clone(),
-                    raw_sa_name,
-                    size,
-                );
+                let cache =
+                    super::block_cache::BlockCache::new(store_arc.clone(), raw_sa_name, size);
                 (None, Some(cache))
             }
             Err(_) => {
@@ -768,11 +775,7 @@ impl SuffixArrayIndex {
     // called eagerly: `.map(|m| self.helper(m, q)).collect::<Vec<_>>()`.
 
     /// Count matches in a single segment (byte-level, tw <= 1).
-    async fn count_segment_byte(
-        &self,
-        meta: &SegmentMeta,
-        query: &[u8],
-    ) -> Result<u64> {
+    async fn count_segment_byte(&self, meta: &SegmentMeta, query: &[u8]) -> Result<u64> {
         let seg = self.get_segment(meta).await?;
         let pw = seg.pointer_width as usize;
         let n = seg.total_entries;
@@ -795,15 +798,14 @@ impl SuffixArrayIndex {
         let seg = self.get_segment(meta).await?;
         let pw = seg.pointer_width as usize;
         let n = seg.total_entries;
-        let (lo, hi) = if let (Some(tok_cache), Some(sa_cache)) =
-            (&seg.tokenized_cache, &seg.sa_cache)
-        {
-            query::sa_find_cached(tok_cache, sa_cache, pw, n, query).await?
-        } else if let (Some(tokenized), Some(sa)) = (&seg.tokenized, &seg.suffix_array) {
-            query::sa_find(tokenized, sa, pw, n, query)
-        } else {
-            (0, 0)
-        };
+        let (lo, hi) =
+            if let (Some(tok_cache), Some(sa_cache)) = (&seg.tokenized_cache, &seg.sa_cache) {
+                query::sa_find_cached(tok_cache, sa_cache, pw, n, query).await?
+            } else if let (Some(tokenized), Some(sa)) = (&seg.tokenized, &seg.suffix_array) {
+                query::sa_find(tokenized, sa, pw, n, query)
+            } else {
+                (0, 0)
+            };
         let ptrs_per_chunk: u64 = (64 * 1024 / pw) as u64;
         let mut seg_total = 0u64;
         let mut rank = lo;
@@ -836,15 +838,14 @@ impl SuffixArrayIndex {
         let seg = self.get_segment(meta).await?;
         let pw = seg.pointer_width as usize;
         let n = seg.total_entries;
-        let (lo, hi) = if let (Some(tok_cache), Some(sa_cache)) =
-            (&seg.tokenized_cache, &seg.sa_cache)
-        {
-            query::sa_find_cached(tok_cache, sa_cache, pw, n, query).await?
-        } else if let (Some(tokenized), Some(sa)) = (&seg.tokenized, &seg.suffix_array) {
-            query::sa_find(tokenized, sa, pw, n, query)
-        } else {
-            (0, 0)
-        };
+        let (lo, hi) =
+            if let (Some(tok_cache), Some(sa_cache)) = (&seg.tokenized_cache, &seg.sa_cache) {
+                query::sa_find_cached(tok_cache, sa_cache, pw, n, query).await?
+            } else if let (Some(tokenized), Some(sa)) = (&seg.tokenized, &seg.suffix_array) {
+                query::sa_find(tokenized, sa, pw, n, query)
+            } else {
+                (0, 0)
+            };
 
         let mut local_docs: HashMap<u64, Vec<u64>> = HashMap::new();
 
@@ -932,9 +933,12 @@ impl SuffixArrayIndex {
         let concurrency = parallel_query_concurrency(self.segment_metas.len());
 
         // Pre-filter segments using bloom filters (sync, no I/O)
-        let active_metas: Vec<&SegmentMeta> = self.segment_metas.iter()
+        let active_metas: Vec<&SegmentMeta> = self
+            .segment_metas
+            .iter()
             .filter(|meta| {
-                meta.bloom_filter.as_ref()
+                meta.bloom_filter
+                    .as_ref()
                     .is_none_or(|bf| bf.might_contain_substring_aligned(query, tw))
             })
             .collect();
@@ -992,7 +996,9 @@ impl SuffixArrayIndex {
         // Pre-filter segments using bloom filters (sync, no I/O)
         let mut segments_skipped = 0usize;
         let mut segments_no_bloom = 0usize;
-        let active_metas: Vec<&SegmentMeta> = self.segment_metas.iter()
+        let active_metas: Vec<&SegmentMeta> = self
+            .segment_metas
+            .iter()
             .filter(|meta| {
                 if let Some(ref bf) = meta.bloom_filter {
                     if !bf.might_contain_substring_aligned(query, tw) {
@@ -1096,9 +1102,7 @@ impl SuffixArrayIndex {
 
             for term in or_group {
                 // Search this single term (no limit — need all docs for intersection)
-                let results = self
-                    .search_rows_scored(term, usize::MAX)
-                    .await?;
+                let results = self.search_rows_scored(term, usize::MAX).await?;
 
                 // Union into group_map (OR semantics: accumulate counts + positions)
                 for (row_id, count, positions) in results {
@@ -1275,11 +1279,7 @@ impl SuffixArrayIndex {
 
     /// Search for matching rows without scoring (legacy API, used by ScalarIndex::search).
     /// Returns deduplicated, sorted row IDs.
-    pub async fn search_rows(
-        &self,
-        query: &[u8],
-        max_results: usize,
-    ) -> Result<Vec<u64>> {
+    pub async fn search_rows(&self, query: &[u8], max_results: usize) -> Result<Vec<u64>> {
         let scored = self.search_rows_scored(query, max_results).await?;
         Ok(scored.into_iter().map(|(row_id, _, _)| row_id).collect())
     }
@@ -1495,10 +1495,7 @@ impl IndexStore for NoopIndexStore {
         Err(Error::not_supported("NoopIndexStore: cannot create files"))
     }
 
-    async fn open_index_file(
-        &self,
-        _name: &str,
-    ) -> Result<Arc<dyn crate::scalar::IndexReader>> {
+    async fn open_index_file(&self, _name: &str) -> Result<Arc<dyn crate::scalar::IndexReader>> {
         Err(Error::not_supported(
             "NoopIndexStore: segments should be in cache",
         ))

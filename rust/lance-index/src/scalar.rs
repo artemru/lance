@@ -267,11 +267,7 @@ pub trait IndexStore: std::fmt::Debug + Send + Sync + DeepSizeOf {
     ///
     /// Returns the bytes in `[range.start, range.end)`. The file must have
     /// been written with [`write_raw_file`](Self::write_raw_file).
-    async fn read_raw_range(
-        &self,
-        _name: &str,
-        _range: std::ops::Range<usize>,
-    ) -> Result<Bytes> {
+    async fn read_raw_range(&self, _name: &str, _range: std::ops::Range<usize>) -> Result<Bytes> {
         Err(Error::not_supported(
             "raw file range read is not supported by this index store",
         ))
@@ -499,8 +495,16 @@ impl InfgramSearchQuery {
             limit: None,
             clauses: None,
             must: if must.is_empty() { None } else { Some(must) },
-            should: if should.is_empty() { None } else { Some(should) },
-            must_not: if must_not.is_empty() { None } else { Some(must_not) },
+            should: if should.is_empty() {
+                None
+            } else {
+                Some(should)
+            },
+            must_not: if must_not.is_empty() {
+                None
+            } else {
+                Some(must_not)
+            },
         }
     }
 

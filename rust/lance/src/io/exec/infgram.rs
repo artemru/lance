@@ -11,7 +11,7 @@ use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
-use arrow_array::{UInt32Array, ListArray, RecordBatch, UInt64Array};
+use arrow_array::{ListArray, RecordBatch, UInt32Array, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
@@ -21,12 +21,12 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
 };
-use futures::stream;
 use futures::StreamExt;
+use futures::stream;
 use lance_core::ROW_ID_FIELD;
 use lance_core::utils::tracing::StreamTracingExt;
-use lance_index::scalar::InfgramSearchQuery;
 use lance_index::IndexCriteria;
+use lance_index::scalar::InfgramSearchQuery;
 use tracing::instrument;
 
 use crate::dataset::Dataset;
@@ -144,9 +144,11 @@ impl ExecutionPlan for InfgramSearchExec {
                             .supports_suffix_array(),
                     )
                     .await
-                    .map_err(|e| DataFusionError::Execution(format!(
-                        "Failed to load SA index for column '{col}': {e}"
-                    )))?
+                    .map_err(|e| {
+                        DataFusionError::Execution(format!(
+                            "Failed to load SA index for column '{col}': {e}"
+                        ))
+                    })?
                     .ok_or_else(|| {
                         DataFusionError::Execution(format!(
                             "No suffix array index found for column '{col}'"
@@ -156,13 +158,11 @@ impl ExecutionPlan for InfgramSearchExec {
             } else {
                 // Find any suffix-array index and resolve its column
                 let meta = ds
-                    .load_scalar_index(
-                        IndexCriteria::default().supports_suffix_array(),
-                    )
+                    .load_scalar_index(IndexCriteria::default().supports_suffix_array())
                     .await
-                    .map_err(|e| DataFusionError::Execution(format!(
-                        "Failed to load SA index: {e}"
-                    )))?
+                    .map_err(|e| {
+                        DataFusionError::Execution(format!("Failed to load SA index: {e}"))
+                    })?
                     .ok_or_else(|| {
                         DataFusionError::Execution(
                             "No suffix array index found in dataset".to_string(),
@@ -185,16 +185,17 @@ impl ExecutionPlan for InfgramSearchExec {
             let indices = ds
                 .load_indices_by_name(&index_meta.name)
                 .await
-                .map_err(|e| DataFusionError::Execution(format!(
-                    "Failed to load SA index segments: {e}"
-                )))?;
+                .map_err(|e| {
+                    DataFusionError::Execution(format!("Failed to load SA index segments: {e}"))
+                })?;
 
             if indices.is_empty() {
                 let empty_positions = {
                     let values = Arc::new(UInt64Array::from(Vec::<u64>::new()));
-                    let offsets = arrow_buffer::OffsetBuffer::new(
-                        arrow_buffer::ScalarBuffer::from(vec![0i32]),
-                    );
+                    let offsets =
+                        arrow_buffer::OffsetBuffer::new(arrow_buffer::ScalarBuffer::from(vec![
+                            0i32,
+                        ]));
                     let field = Arc::new(Field::new("item", DataType::UInt64, false));
                     ListArray::new(field, offsets, values, None)
                 };
@@ -214,9 +215,8 @@ impl ExecutionPlan for InfgramSearchExec {
             let mut all_scored: Vec<(u64, u32, Vec<u64>)> = Vec::new();
 
             // Check if we have boolean clauses or parse the query for AND/OR
-            let parsed_clauses = query_clauses.or_else(|| {
-                InfgramSearchQuery::parse_boolean_query(&query_text)
-            });
+            let parsed_clauses =
+                query_clauses.or_else(|| InfgramSearchQuery::parse_boolean_query(&query_text));
 
             for meta in &indices {
                 let uuid = meta.uuid.to_string();
@@ -258,7 +258,12 @@ impl ExecutionPlan for InfgramSearchExec {
                     let must_not_bytes = to_bytes(&query_must_not);
 
                     let scored = sa_index
-                        .search_boolean_occur(&must_bytes, &should_bytes, &must_not_bytes, max_results)
+                        .search_boolean_occur(
+                            &must_bytes,
+                            &should_bytes,
+                            &must_not_bytes,
+                            max_results,
+                        )
                         .await
                         .map_err(|e| DataFusionError::Execution(e.to_string()))?;
                     all_scored.extend(scored);
@@ -339,9 +344,8 @@ impl ExecutionPlan for InfgramSearchExec {
                     offsets.push(values.len() as i32);
                 }
                 let values_array = Arc::new(UInt64Array::from(values));
-                let offsets_buffer = arrow_buffer::OffsetBuffer::new(
-                    arrow_buffer::ScalarBuffer::from(offsets),
-                );
+                let offsets_buffer =
+                    arrow_buffer::OffsetBuffer::new(arrow_buffer::ScalarBuffer::from(offsets));
                 let field = Arc::new(Field::new("item", DataType::UInt64, false));
                 ListArray::new(field, offsets_buffer, values_array, None)
             };

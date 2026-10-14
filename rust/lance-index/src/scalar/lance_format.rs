@@ -358,11 +358,7 @@ impl IndexStore for LanceIndexStore {
         Ok(())
     }
 
-    async fn read_raw_range(
-        &self,
-        name: &str,
-        range: std::ops::Range<usize>,
-    ) -> Result<Bytes> {
+    async fn read_raw_range(&self, name: &str, range: std::ops::Range<usize>) -> Result<Bytes> {
         self.object_store
             .read_one_range(&self.index_dir.clone().join(name), range)
             .await

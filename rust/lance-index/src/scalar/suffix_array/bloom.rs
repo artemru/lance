@@ -229,14 +229,18 @@ impl BloomFilter {
     fn double_hash(&self, item: &[u8]) -> (u64, u64) {
         // Hash 1: default hasher with seed 0
         let h1 = {
-            let bh = std::hash::BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default();
+            let bh =
+                std::hash::BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default(
+                );
             let mut h = bh.build_hasher();
             h.write(item);
             h.finish()
         };
         // Hash 2: mix in a constant to get a different hash
         let h2 = {
-            let bh = std::hash::BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default();
+            let bh =
+                std::hash::BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default(
+                );
             let mut h = bh.build_hasher();
             h.write(item);
             h.write_u64(0x517cc1b727220a95); // golden ratio constant

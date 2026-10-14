@@ -37,7 +37,9 @@ use crate::scalar::registry::{
 use crate::scalar::{CreatedIndex, IndexStore, ScalarIndex};
 
 use super::bloom::BloomFilter;
-use super::builder::{build_suffix_array, compact_suffix_array, compute_pointer_width, release_memory_to_os};
+use super::builder::{
+    build_suffix_array, compact_suffix_array, compute_pointer_width, release_memory_to_os,
+};
 use super::index::SuffixArrayIndex;
 
 const SUFFIX_ARRAY_INDEX_VERSION: u32 = 0;
@@ -58,7 +60,6 @@ fn max_parallel_builders() -> usize {
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(4)
 }
-
 
 /// Result of building a suffix array for a single segment.
 struct BuiltSegment {
@@ -150,11 +151,16 @@ async fn write_segment(
         .write_raw_file(&format!("segment_{seg_idx}_tokenized.raw"), &built.text)
         .await?;
     index_store
-        .write_raw_file(&format!("segment_{seg_idx}_suffix_array.raw"), &built.compact_sa)
+        .write_raw_file(
+            &format!("segment_{seg_idx}_suffix_array.raw"),
+            &built.compact_sa,
+        )
         .await?;
 
     // Write document offsets (u64 array, one per document)
-    let offsets_bytes: Vec<u8> = built.doc_offsets.iter()
+    let offsets_bytes: Vec<u8> = built
+        .doc_offsets
+        .iter()
         .flat_map(|o| o.to_le_bytes())
         .collect();
     let offsets_schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
@@ -168,14 +174,14 @@ async fn write_segment(
             offsets_bytes.as_slice(),
         ]))],
     )?;
-    let mut offsets_writer = index_store.new_index_file(&offsets_name, offsets_schema).await?;
+    let mut offsets_writer = index_store
+        .new_index_file(&offsets_name, offsets_schema)
+        .await?;
     offsets_writer.write_record_batch(offsets_batch).await?;
     offsets_writer.finish().await?;
 
     // Write row IDs (u64 array, one per document — Lance row addresses)
-    let row_ids_bytes: Vec<u8> = built.row_ids.iter()
-        .flat_map(|r| r.to_le_bytes())
-        .collect();
+    let row_ids_bytes: Vec<u8> = built.row_ids.iter().flat_map(|r| r.to_le_bytes()).collect();
     let row_ids_schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
         "data",
         arrow_schema::DataType::LargeBinary,
@@ -187,7 +193,9 @@ async fn write_segment(
             row_ids_bytes.as_slice(),
         ]))],
     )?;
-    let mut row_ids_writer = index_store.new_index_file(&row_ids_name, row_ids_schema).await?;
+    let mut row_ids_writer = index_store
+        .new_index_file(&row_ids_name, row_ids_schema)
+        .await?;
     row_ids_writer.write_record_batch(row_ids_batch).await?;
     row_ids_writer.finish().await?;
 
@@ -204,7 +212,9 @@ async fn write_segment(
                 built.bloom_bytes.as_slice(),
             ]))],
         )?;
-        let mut bloom_writer = index_store.new_index_file(&bloom_name, bloom_schema).await?;
+        let mut bloom_writer = index_store
+            .new_index_file(&bloom_name, bloom_schema)
+            .await?;
         bloom_writer.write_record_batch(bloom_batch).await?;
         bloom_writer.finish().await?;
     }
@@ -245,9 +255,10 @@ fn extract_bytes(
     let mut docs = 0u64;
     match col.data_type() {
         DataType::Utf8 => {
-            let arr = col.as_any().downcast_ref::<arrow_array::StringArray>().ok_or_else(|| {
-                Error::invalid_input("Failed to downcast to StringArray")
-            })?;
+            let arr = col
+                .as_any()
+                .downcast_ref::<arrow_array::StringArray>()
+                .ok_or_else(|| Error::invalid_input("Failed to downcast to StringArray"))?;
             for i in 0..arr.len() {
                 if !arr.is_null(i) {
                     if case_insensitive {
@@ -262,9 +273,10 @@ fn extract_bytes(
             }
         }
         DataType::LargeUtf8 => {
-            let arr = col.as_any().downcast_ref::<arrow_array::LargeStringArray>().ok_or_else(|| {
-                Error::invalid_input("Failed to downcast to LargeStringArray")
-            })?;
+            let arr = col
+                .as_any()
+                .downcast_ref::<arrow_array::LargeStringArray>()
+                .ok_or_else(|| Error::invalid_input("Failed to downcast to LargeStringArray"))?;
             for i in 0..arr.len() {
                 if !arr.is_null(i) {
                     if case_insensitive {
@@ -279,9 +291,10 @@ fn extract_bytes(
             }
         }
         DataType::Binary => {
-            let arr = col.as_any().downcast_ref::<arrow_array::BinaryArray>().ok_or_else(|| {
-                Error::invalid_input("Failed to downcast to BinaryArray")
-            })?;
+            let arr = col
+                .as_any()
+                .downcast_ref::<arrow_array::BinaryArray>()
+                .ok_or_else(|| Error::invalid_input("Failed to downcast to BinaryArray"))?;
             for i in 0..arr.len() {
                 if !arr.is_null(i) {
                     out.extend_from_slice(arr.value(i));
@@ -292,9 +305,10 @@ fn extract_bytes(
             }
         }
         DataType::LargeBinary => {
-            let arr = col.as_any().downcast_ref::<arrow_array::LargeBinaryArray>().ok_or_else(|| {
-                Error::invalid_input("Failed to downcast to LargeBinaryArray")
-            })?;
+            let arr = col
+                .as_any()
+                .downcast_ref::<arrow_array::LargeBinaryArray>()
+                .ok_or_else(|| Error::invalid_input("Failed to downcast to LargeBinaryArray"))?;
             for i in 0..arr.len() {
                 if !arr.is_null(i) {
                     out.extend_from_slice(arr.value(i));
@@ -330,13 +344,20 @@ fn extract_token_list_bytes(
     use arrow_array::{Int16Array, Int32Array, Int64Array, UInt16Array, UInt32Array, UInt64Array};
 
     // Determine element type and token width from the list's value type.
-    let (elem_type, values_ref) = if let Some(list_arr) = col.as_any().downcast_ref::<arrow_array::ListArray>() {
-        (list_arr.values().data_type().clone(), list_arr.values().clone())
-    } else if let Some(list_arr) = col.as_any().downcast_ref::<arrow_array::LargeListArray>() {
-        (list_arr.values().data_type().clone(), list_arr.values().clone())
-    } else {
-        return Err(Error::invalid_input("Expected List or LargeList array"));
-    };
+    let (elem_type, values_ref) =
+        if let Some(list_arr) = col.as_any().downcast_ref::<arrow_array::ListArray>() {
+            (
+                list_arr.values().data_type().clone(),
+                list_arr.values().clone(),
+            )
+        } else if let Some(list_arr) = col.as_any().downcast_ref::<arrow_array::LargeListArray>() {
+            (
+                list_arr.values().data_type().clone(),
+                list_arr.values().clone(),
+            )
+        } else {
+            return Err(Error::invalid_input("Expected List or LargeList array"));
+        };
 
     // Int64/UInt64 are downcast to 4-byte tokens (validated below).
     let token_width: usize = match &elem_type {
@@ -350,7 +371,11 @@ fn extract_token_list_bytes(
     };
 
     let sep = separator_token_id.unwrap_or({
-        if token_width == 2 { 0xFFFF } else { 0xFFFF_FFFF }
+        if token_width == 2 {
+            0xFFFF
+        } else {
+            0xFFFF_FFFF
+        }
     });
     let sep_bytes: Vec<u8> = sep.to_le_bytes()[..token_width].to_vec();
 
@@ -376,7 +401,9 @@ fn extract_token_list_bytes(
     };
 
     for i in 0..num_rows {
-        let Some((start, end)) = get_offsets(i) else { continue };
+        let Some((start, end)) = get_offsets(i) else {
+            continue;
+        };
 
         // Insert separator between documents (not before the first)
         if docs > 0 {
@@ -484,9 +511,7 @@ impl ScalarIndexPlugin for SuffixArrayIndexPlugin {
             SuffixArrayBuildParams::default()
         } else {
             serde_json::from_str(params).map_err(|e| {
-                Error::invalid_input(format!(
-                    "Failed to parse suffix array index params: {e}"
-                ))
+                Error::invalid_input(format!("Failed to parse suffix array index params: {e}"))
             })?
         };
         Ok(Box::new(SuffixArrayTrainingRequest::new(build_params)))
@@ -563,7 +588,11 @@ impl ScalarIndexPlugin for SuffixArrayIndexPlugin {
 
         if token_width > 1 {
             let sep = separator_token_id.unwrap_or({
-                if token_width == 2 { 0xFFFF } else { 0xFFFF_FFFF }
+                if token_width == 2 {
+                    0xFFFF
+                } else {
+                    0xFFFF_FFFF
+                }
             });
             info!(
                 token_width,
@@ -628,12 +657,11 @@ impl ScalarIndexPlugin for SuffixArrayIndexPlugin {
                 let pool = rayon::ThreadPoolBuilder::new()
                     .num_threads(batch_size)
                     .build()
-                    .map_err(|e| Error::io(
-                        format!("Failed to create rayon thread pool: {e}"),
-                    ))?;
+                    .map_err(|e| Error::io(format!("Failed to create rayon thread pool: {e}")))?;
 
                 pool.install(|| {
-                    batch.into_par_iter()
+                    batch
+                        .into_par_iter()
                         .enumerate()
                         .map(|(i, (text, doc_offsets, row_ids))| {
                             let seg_idx = seg_offset + i;
@@ -658,7 +686,8 @@ impl ScalarIndexPlugin for SuffixArrayIndexPlugin {
 
                             // Build bloom filter for fast segment skipping
                             let bloom_bytes = if token_width > 1 {
-                                BloomFilter::from_text_token_aligned(&text, token_width as usize).to_bytes()
+                                BloomFilter::from_text_token_aligned(&text, token_width as usize)
+                                    .to_bytes()
                             } else {
                                 BloomFilter::from_text(&text).to_bytes()
                             };
@@ -676,9 +705,9 @@ impl ScalarIndexPlugin for SuffixArrayIndexPlugin {
                         })
                         .collect::<Result<Vec<_>>>()
                 })
-            }).await.map_err(|e| Error::io(
-                format!("SA builder task panicked: {e}"),
-            ))??;
+            })
+            .await
+            .map_err(|e| Error::io(format!("SA builder task panicked: {e}")))??;
 
             for built in &built_batch {
                 let info = write_segment(index_store, built).await?;
@@ -701,16 +730,22 @@ impl ScalarIndexPlugin for SuffixArrayIndexPlugin {
             let row_id_col = batch[ROW_ID]
                 .as_any()
                 .downcast_ref::<arrow_array::UInt64Array>()
-                .ok_or_else(|| Error::invalid_input(
-                    "Training data stream missing '_rowid' column (UInt64)"
-                ))?;
+                .ok_or_else(|| {
+                    Error::invalid_input("Training data stream missing '_rowid' column (UInt64)")
+                })?;
             for i in 0..col.len() {
                 if !col.is_null(i) {
                     current_row_ids.push(row_id_col.value(i));
                 }
             }
 
-            let docs = extract_bytes(col.as_ref(), &mut current_bytes, &mut current_doc_offsets, case_insensitive, separator_token_id)?;
+            let docs = extract_bytes(
+                col.as_ref(),
+                &mut current_bytes,
+                &mut current_doc_offsets,
+                case_insensitive,
+                separator_token_id,
+            )?;
             total_documents += docs;
 
             // Split off complete segments as we accumulate data.
@@ -753,7 +788,8 @@ impl ScalarIndexPlugin for SuffixArrayIndexPlugin {
                         &mut segment_infos,
                         index_store,
                         token_width,
-                    ).await?;
+                    )
+                    .await?;
                 }
             }
         }
@@ -777,7 +813,8 @@ impl ScalarIndexPlugin for SuffixArrayIndexPlugin {
                 &mut segment_infos,
                 index_store,
                 token_width,
-            ).await?;
+            )
+            .await?;
         }
 
         let num_segments = segment_infos.len();
@@ -826,7 +863,11 @@ impl ScalarIndexPlugin for SuffixArrayIndexPlugin {
             vocab_size: None,
             separator_token_id: if token_width > 1 {
                 let sep = separator_token_id.unwrap_or({
-                    if token_width == 2 { 0xFFFF } else { 0xFFFF_FFFF }
+                    if token_width == 2 {
+                        0xFFFF
+                    } else {
+                        0xFFFF_FFFF
+                    }
                 });
                 Some(sep)
             } else {
@@ -866,9 +907,7 @@ impl ScalarIndexPlugin for SuffixArrayIndexPlugin {
             // built with streaming pipeline that always uses segment_N_ naming.
             info!(
                 num_segments = details.segments.len(),
-                case_insensitive,
-                token_width,
-                "Loading multi-segment suffix array index"
+                case_insensitive, token_width, "Loading multi-segment suffix array index"
             );
             Ok(SuffixArrayIndex::load_multi(
                 index_store,
@@ -876,7 +915,8 @@ impl ScalarIndexPlugin for SuffixArrayIndexPlugin {
                 build_params,
                 token_width,
                 cache,
-            ).await? as Arc<dyn ScalarIndex>)
+            )
+            .await? as Arc<dyn ScalarIndex>)
         } else {
             // Single-segment index (v0 / backwards compat)
             let pointer_width = details.pointer_width as u8;
@@ -1165,7 +1205,11 @@ mod tests {
         let tmpdir = TempDir::default();
         let store = local_store(&tmpdir);
         let created = train(
-            &["the quick brown fox", "jumps over the lazy dog", "the cat sat on the mat"],
+            &[
+                "the quick brown fox",
+                "jumps over the lazy dog",
+                "the cat sat on the mat",
+            ],
             "",
             store.as_ref(),
         )
@@ -1174,9 +1218,18 @@ mod tests {
         // Both large blobs are raw files written at build time (block-cached
         // reads); no tokenized Lance file is written.
         let names = file_names(store.as_ref()).await;
-        assert!(names.contains(&"segment_0_tokenized.raw".to_string()), "{names:?}");
-        assert!(names.contains(&"segment_0_suffix_array.raw".to_string()), "{names:?}");
-        assert!(!names.iter().any(|n| n.ends_with("tokenized.bin")), "{names:?}");
+        assert!(
+            names.contains(&"segment_0_tokenized.raw".to_string()),
+            "{names:?}"
+        );
+        assert!(
+            names.contains(&"segment_0_suffix_array.raw".to_string()),
+            "{names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.ends_with("tokenized.bin")),
+            "{names:?}"
+        );
 
         let index = load(&created, store.clone()).await;
         let sa = as_suffix_array(&index);
@@ -1204,7 +1257,10 @@ mod tests {
             "segment_0_doc_offsets.bin",
             "segment_0_row_ids.bin",
         ] {
-            assert!(names.contains(&expected.to_string()), "missing {expected}: {names:?}");
+            assert!(
+                names.contains(&expected.to_string()),
+                "missing {expected}: {names:?}"
+            );
         }
 
         let index = load(&created, store.clone()).await;
@@ -1226,13 +1282,22 @@ mod tests {
         let raw_name = "segment_0_tokenized.raw";
         let size = store.raw_file_size(raw_name).await.unwrap();
         let text = store.read_raw_range(raw_name, 0..size).await.unwrap();
-        let schema = Arc::new(Schema::new(vec![Field::new("data", DataType::LargeBinary, false)]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "data",
+            DataType::LargeBinary,
+            false,
+        )]));
         let batch = RecordBatch::try_new(
             schema.clone(),
-            vec![Arc::new(arrow_array::LargeBinaryArray::from(vec![text.as_ref()]))],
+            vec![Arc::new(arrow_array::LargeBinaryArray::from(vec![
+                text.as_ref(),
+            ]))],
         )
         .unwrap();
-        let mut writer = store.new_index_file("segment_0_tokenized.bin", schema).await.unwrap();
+        let mut writer = store
+            .new_index_file("segment_0_tokenized.bin", schema)
+            .await
+            .unwrap();
         writer.write_record_batch(batch).await.unwrap();
         writer.finish().await.unwrap();
         store.delete_index_file(raw_name).await.unwrap();
@@ -1290,7 +1355,10 @@ mod tests {
         // Queries are normalized by the index itself, whatever their case.
         assert_eq!(sa.total_count(b"FOX").await.unwrap(), 2);
         assert_eq!(sa.total_count(b"fox").await.unwrap(), 2);
-        assert_eq!(sa.compute_prob(b"A NEW ", b"ONE").await.unwrap().cont_cnt, 1);
+        assert_eq!(
+            sa.compute_prob(b"A NEW ", b"ONE").await.unwrap().cont_cnt,
+            1
+        );
         assert_eq!(search_rows(updated.as_ref(), b"New").await, vec![2]);
     }
 

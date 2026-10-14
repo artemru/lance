@@ -515,7 +515,10 @@ pub fn index_matches_criteria(
         // An index without details cannot satisfy type-specific criteria
         // (FTS, suffix array, etc.) — only concrete index details can prove
         // the index is of the required type.
-        if criteria.must_support_fts || criteria.must_support_suffix_array || criteria.must_support_exact_equality {
+        if criteria.must_support_fts
+            || criteria.must_support_suffix_array
+            || criteria.must_support_exact_equality
+        {
             return Ok(false);
         }
 
@@ -525,7 +528,10 @@ pub fn index_matches_criteria(
 
     // Vector indices cannot satisfy scalar-specific criteria
     if index_details.is_vector() {
-        if criteria.must_support_fts || criteria.must_support_suffix_array || criteria.must_support_exact_equality {
+        if criteria.must_support_fts
+            || criteria.must_support_suffix_array
+            || criteria.must_support_exact_equality
+        {
             return Ok(false);
         }
         return Ok(true);
@@ -1892,7 +1898,8 @@ mod tests {
         // embedding vector index instead of the SA index.
         let vector_index = make_index_metadata("sonar_emb_idx", 1, Some(IndexType::Vector));
 
-        let field = Field::new_arrow("source_text_sonar2omni_emb", DataType::Float32, true).unwrap();
+        let field =
+            Field::new_arrow("source_text_sonar2omni_emb", DataType::Float32, true).unwrap();
         let schema = lance_core::datatypes::Schema {
             fields: vec![field.clone()],
             metadata: Default::default(),
@@ -1940,10 +1947,7 @@ mod tests {
         let criteria = IndexCriteria::default().supports_suffix_array();
         let result =
             index_matches_criteria(&btree_index, &criteria, &[&field], false, &schema).unwrap();
-        assert!(
-            !result,
-            "BTree index must NOT match suffix array criteria"
-        );
+        assert!(!result, "BTree index must NOT match suffix array criteria");
     }
 
     #[test]
@@ -2002,10 +2006,7 @@ mod tests {
         let result =
             index_matches_criteria(&no_details_index, &criteria, &[&field], false, &schema)
                 .unwrap();
-        assert!(
-            !result,
-            "Index without details must NOT match FTS criteria"
-        );
+        assert!(!result, "Index without details must NOT match FTS criteria");
     }
 
     #[test]

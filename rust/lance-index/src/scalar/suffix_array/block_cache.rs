@@ -146,12 +146,7 @@ impl BlockCache {
 
     /// Approximate memory usage of cached blocks.
     pub async fn cached_bytes(&self) -> usize {
-        self.blocks
-            .read()
-            .await
-            .values()
-            .map(|b| b.len())
-            .sum()
+        self.blocks.read().await.values().map(|b| b.len()).sum()
     }
 
     async fn get_block(&self, block_idx: usize) -> Result<Bytes> {

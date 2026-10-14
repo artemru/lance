@@ -584,11 +584,7 @@ pub async fn read_pointers_batch(
 }
 
 /// Async suffix comparison: reads bytes via block cache.
-async fn compare_suffix_cached(
-    tok_cache: &BlockCache,
-    pos: u64,
-    query: &[u8],
-) -> Result<Ordering> {
+async fn compare_suffix_cached(tok_cache: &BlockCache, pos: u64, query: &[u8]) -> Result<Ordering> {
     let pos_usize = pos as usize;
     let available = tok_cache.len().saturating_sub(pos_usize);
     let cmp_len = available.min(query.len());
@@ -756,15 +752,24 @@ pub async fn next_byte_distribution_cached(
         let step = prompt_cnt / max;
         for i in 0..max {
             let rank = lo + i * step;
-            if let Some(b) = get_next_byte_cached(tok_cache, sa_cache, ptr_width, prompt_len, rank).await? {
+            if let Some(b) =
+                get_next_byte_cached(tok_cache, sa_cache, ptr_width, prompt_len, rank).await?
+            {
                 *byte_counts.entry(b).or_insert(0) += step;
             }
         }
     } else {
         // Divide-and-conquer over the SA range (async version)
         ntd_divide_and_conquer_cached(
-            tok_cache, sa_cache, ptr_width, prompt_len, lo, hi, &mut byte_counts,
-        ).await?;
+            tok_cache,
+            sa_cache,
+            ptr_width,
+            prompt_len,
+            lo,
+            hi,
+            &mut byte_counts,
+        )
+        .await?;
     }
 
     let mut distribution: Vec<NtdEntry> = byte_counts
@@ -806,7 +811,8 @@ async fn ntd_divide_and_conquer_cached(
         return Ok(());
     }
 
-    let last_byte = get_next_byte_cached(tok_cache, sa_cache, ptr_width, prompt_len, hi - 1).await?;
+    let last_byte =
+        get_next_byte_cached(tok_cache, sa_cache, ptr_width, prompt_len, hi - 1).await?;
 
     if first_byte == last_byte {
         if let Some(b) = first_byte {
@@ -816,11 +822,25 @@ async fn ntd_divide_and_conquer_cached(
         let mid = lo + (hi - lo) / 2;
         // Use Box::pin for recursive async (avoids infinite type)
         Box::pin(ntd_divide_and_conquer_cached(
-            tok_cache, sa_cache, ptr_width, prompt_len, lo, mid, byte_counts,
-        )).await?;
+            tok_cache,
+            sa_cache,
+            ptr_width,
+            prompt_len,
+            lo,
+            mid,
+            byte_counts,
+        ))
+        .await?;
         Box::pin(ntd_divide_and_conquer_cached(
-            tok_cache, sa_cache, ptr_width, prompt_len, mid, hi, byte_counts,
-        )).await?;
+            tok_cache,
+            sa_cache,
+            ptr_width,
+            prompt_len,
+            mid,
+            hi,
+            byte_counts,
+        ))
+        .await?;
     }
 
     Ok(())

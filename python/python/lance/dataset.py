@@ -941,10 +941,8 @@ class LanceDataset(pa.dataset.Dataset):
                 )
             if isinstance(continuation, str):
                 continuation = continuation.encode("utf-8")
-            prompt_cnt, cont_cnt, prob, suffix_len = (
-                self._ds.suffix_array_infgram_prob(
-                    index_name, query, continuation
-                )
+            prompt_cnt, cont_cnt, prob, suffix_len = self._ds.suffix_array_infgram_prob(
+                index_name, query, continuation
             )
             return {
                 "prompt_cnt": prompt_cnt,
@@ -3210,7 +3208,10 @@ class LanceDataset(pa.dataset.Dataset):
                     and not pa.types.is_binary(field_type)
                     and not pa.types.is_large_binary(field_type)
                     and not (
-                        (pa.types.is_list(field_type) or pa.types.is_large_list(field_type))
+                        (
+                            pa.types.is_list(field_type)
+                            or pa.types.is_large_list(field_type)
+                        )
                         and field_type.value_type
                         in (
                             pa.int16(),

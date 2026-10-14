@@ -2478,57 +2478,71 @@ impl Scanner {
 
         let mut use_limit_node = true;
         // Source: either a (K|A)NN search, full text search, infgram search, or a (full|indexed) scan
-        let mut plan: Arc<dyn ExecutionPlan> = if self.nearest.is_some() && self.full_text_query.is_none() && self.infgram_query.is_none() {
+        let mut plan: Arc<dyn ExecutionPlan> = if self.nearest.is_some()
+            && self.full_text_query.is_none()
+            && self.infgram_query.is_none()
+        {
             self.vector_search_source(&mut filter_plan).await?
-        } else if self.nearest.is_none() && self.full_text_query.is_some() && self.infgram_query.is_none() {
-            self.fts_search_source(&mut filter_plan, self.full_text_query.as_ref().unwrap()).await?
-        } else if self.nearest.is_none() && self.full_text_query.is_none() && self.infgram_query.is_some() {
+        } else if self.nearest.is_none()
+            && self.full_text_query.is_some()
+            && self.infgram_query.is_none()
+        {
+            self.fts_search_source(&mut filter_plan, self.full_text_query.as_ref().unwrap())
+                .await?
+        } else if self.nearest.is_none()
+            && self.full_text_query.is_none()
+            && self.infgram_query.is_some()
+        {
             self.infgram_search_source(&mut filter_plan).await?
-        } else if self.nearest.is_none() && self.full_text_query.is_none() && self.infgram_query.is_none() {
-                if self.projection_plan.has_output_cols()
-                    && self.projection_plan.physical_projection.is_empty()
-                {
-                    // This means the user is doing something like `SELECT 1 AS foo`.  We don't support this and
-                    // I'm not sure we should.  Users should use a full SQL API to do something like this.
-                    //
-                    // It's also possible we get here from `SELECT does_not_exist`
+        } else if self.nearest.is_none()
+            && self.full_text_query.is_none()
+            && self.infgram_query.is_none()
+        {
+            if self.projection_plan.has_output_cols()
+                && self.projection_plan.physical_projection.is_empty()
+            {
+                // This means the user is doing something like `SELECT 1 AS foo`.  We don't support this and
+                // I'm not sure we should.  Users should use a full SQL API to do something like this.
+                //
+                // It's also possible we get here from `SELECT does_not_exist`
 
-                    // Note: even though we are just going to return an error we still want to calculate the
-                    // final projection here.  This lets us distinguish between a user doing something like:
-                    //
-                    // SELECT 1 FROM t (not supported error)
-                    // SELECT non_existent_column FROM t (column not found error)
-                    let output_expr = self.calculate_final_projection(&ArrowSchema::empty())?;
-                    return Err(Error::not_supported_source(format!("Scans must request at least one column.  Received only dynamic expressions: {:?}", output_expr).into()));
-                }
+                // Note: even though we are just going to return an error we still want to calculate the
+                // final projection here.  This lets us distinguish between a user doing something like:
+                //
+                // SELECT 1 FROM t (not supported error)
+                // SELECT non_existent_column FROM t (column not found error)
+                let output_expr = self.calculate_final_projection(&ArrowSchema::empty())?;
+                return Err(Error::not_supported_source(format!("Scans must request at least one column.  Received only dynamic expressions: {:?}", output_expr).into()));
+            }
 
-                let take_op = filter_plan
-                    .expr_filter_plan
-                    .full_expr
-                    .as_ref()
-                    .and_then(TakeOperation::try_from_expr);
-                if let Some((take_op, remainder)) = take_op {
-                    // If there is any remainder use it as the filter (we don't even try and combine an indexed
-                    // search on the filter with a take as that seems excessive)
-                    filter_plan.expr_filter_plan = remainder
-                        .map(ExprFilterPlan::new_refine_only)
-                        .unwrap_or(ExprFilterPlan::default());
-                    self.take_source(take_op).await?
-                } else {
-                    let planned_read = self
-                        .filtered_read_source(&mut filter_plan.expr_filter_plan)
-                        .await?;
-                    if planned_read.limit_pushed_down {
-                        use_limit_node = false;
-                    }
-                    if planned_read.filter_pushed_down {
-                        filter_plan.disable_refine();
-                    }
-                    planned_read.plan
+            let take_op = filter_plan
+                .expr_filter_plan
+                .full_expr
+                .as_ref()
+                .and_then(TakeOperation::try_from_expr);
+            if let Some((take_op, remainder)) = take_op {
+                // If there is any remainder use it as the filter (we don't even try and combine an indexed
+                // search on the filter with a take as that seems excessive)
+                filter_plan.expr_filter_plan = remainder
+                    .map(ExprFilterPlan::new_refine_only)
+                    .unwrap_or(ExprFilterPlan::default());
+                self.take_source(take_op).await?
+            } else {
+                let planned_read = self
+                    .filtered_read_source(&mut filter_plan.expr_filter_plan)
+                    .await?;
+                if planned_read.limit_pushed_down {
+                    use_limit_node = false;
                 }
+                if planned_read.filter_pushed_down {
+                    filter_plan.disable_refine();
+                }
+                planned_read.plan
+            }
         } else {
             return Err(Error::invalid_input_source(
-                "Cannot combine multiple search types (nearest, full_text_query, infgram_query)".into(),
+                "Cannot combine multiple search types (nearest, full_text_query, infgram_query)"
+                    .into(),
             ));
         };
 
@@ -3036,10 +3050,7 @@ impl Scanner {
         filter_plan.make_refine_only();
 
         let plan: Arc<dyn ExecutionPlan> = Arc::new(
-            crate::io::exec::infgram::InfgramSearchExec::new(
-                self.dataset.clone(),
-                query,
-            ),
+            crate::io::exec::infgram::InfgramSearchExec::new(self.dataset.clone(), query),
         );
         Ok(plan)
     }
@@ -11242,7 +11253,11 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             );
         }
         assert_eq!(
-            output.schema().field_with_name(COUNT_COL).unwrap().data_type(),
+            output
+                .schema()
+                .field_with_name(COUNT_COL)
+                .unwrap()
+                .data_type(),
             &DataType::UInt32
         );
         let mut counts: Vec<u32> = output[COUNT_COL]
