@@ -1020,4 +1020,68 @@ mod tests {
         let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
         assert_eq!(query_id_count(&dataset, "song-42").await, 1);
     }
+
+    #[tokio::test]
+    async fn test_optimize_suffix_array_index_after_append() {
+        use lance_index::scalar::InfgramSearchQuery;
+
+        async fn infgram_rows(dataset: &Dataset, pattern: &str) -> usize {
+            let mut scan = dataset.scan();
+            scan.infgram_search(InfgramSearchQuery::new(pattern.to_string()))
+                .unwrap();
+            scan.try_into_batch().await.unwrap().num_rows()
+        }
+
+        async fn unindexed_rows(dataset: &Dataset) -> u64 {
+            let stats: serde_json::Value =
+                serde_json::from_str(&dataset.index_statistics("sa_idx").await.unwrap()).unwrap();
+            stats["num_unindexed_rows"].as_u64().unwrap()
+        }
+
+        let test_dir = TempStrDir::default();
+        let schema = Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, false)]));
+        let reader = |texts: Vec<&str>| {
+            let batch =
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(texts))])
+                    .unwrap();
+            RecordBatchIterator::new(vec![Ok(batch)], schema.clone())
+        };
+        let mut dataset = Dataset::write(
+            reader(vec!["the quick brown fox", "a lazy dog", "the cat sat"]),
+            test_dir.as_str(),
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["text"],
+                IndexType::SuffixArray,
+                Some("sa_idx".into()),
+                &ScalarIndexParams::new("suffixarray".to_string()),
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(infgram_rows(&dataset, "fox").await, 1);
+
+        dataset
+            .append(reader(vec!["a zebra and a fox"]), None)
+            .await
+            .unwrap();
+        assert_eq!(unindexed_rows(&dataset).await, 1);
+
+        // The suffix array index takes part in index optimization: appended
+        // rows are folded in by rebuilding the index.
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+        assert_eq!(unindexed_rows(&dataset).await, 0);
+        assert_eq!(infgram_rows(&dataset, "zebra").await, 1);
+        assert_eq!(infgram_rows(&dataset, "fox").await, 2);
+    }
 }

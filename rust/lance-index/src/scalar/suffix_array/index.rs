@@ -37,7 +37,8 @@ use tracing::{info, warn};
 
 use crate::frag_reuse::FragReuseIndex;
 use crate::metrics::MetricsCollector;
-use crate::scalar::registry::{TrainingCriteria, TrainingOrdering};
+use crate::progress::NoopIndexBuildProgress;
+use crate::scalar::registry::{ScalarIndexPlugin, TrainingCriteria, TrainingOrdering};
 use crate::scalar::{
     AnyQuery, CreatedIndex, IndexStore, OldIndexDataFilter, ScalarIndex, ScalarIndexParams,
     SearchResult, UpdateCriteria,
@@ -46,6 +47,7 @@ use crate::vector::VectorIndex;
 use crate::{Index, IndexType};
 
 use super::bloom::BloomFilter;
+use super::plugin::{SuffixArrayBuildParams, SuffixArrayIndexPlugin, SuffixArrayTrainingRequest};
 use super::query::{self, SuffixArrayQuery};
 
 /// Maximum number of segments to query concurrently.
@@ -220,9 +222,10 @@ pub struct SuffixArrayIndex {
     /// When set, `get_segment()` returns from here instead of the cache.
     /// This avoids needing an async runtime in test/build code.
     preloaded: Option<Vec<Arc<SuffixArraySegment>>>,
-    /// When true, the corpus was lowercased at build time.
-    /// Queries must be lowercased before searching.
-    case_insensitive: bool,
+    /// Options the index was built with. When `case_insensitive` is set the
+    /// corpus was lowercased at build time, so queries are lowercased too
+    /// (see [`Self::normalize_query`]). Also reused to rebuild the index.
+    build_params: SuffixArrayBuildParams,
     /// Bytes per token unit. 1 for byte-level (text), 2 for int16/uint16,
     /// 4 for int32/uint32. Queries on token-level indices are constrained
     /// to positions aligned to `token_width` boundaries.
@@ -233,7 +236,7 @@ impl std::fmt::Debug for SuffixArrayIndex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SuffixArrayIndex")
             .field("num_segments", &self.segment_metas.len())
-            .field("case_insensitive", &self.case_insensitive)
+            .field("build_params", &self.build_params)
             .field("token_width", &self.token_width)
             .finish()
     }
@@ -274,7 +277,7 @@ impl Index for SuffixArrayIndex {
             "index_type": "SuffixArray",
             "num_segments": self.segment_metas.len(),
             "total_entries": self.segment_metas.iter().map(|m| m.total_entries).sum::<u64>(),
-            "case_insensitive": self.case_insensitive,
+            "case_insensitive": self.build_params.case_insensitive,
             "token_width": self.token_width,
             "lazy_loading": true,
         }))
@@ -304,7 +307,13 @@ impl ScalarIndex for SuffixArrayIndex {
         query_obj: &dyn AnyQuery,
         _metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
-        let sa_query = query_obj
+        // Only row-selection queries go through the scalar-index search contract.
+        // Corpus statistics (counts, probabilities, next-byte distributions) are
+        // exposed by the dedicated methods (`total_count`, `compute_prob`, ...).
+        let SuffixArrayQuery::Search {
+            query_bytes,
+            max_results,
+        } = query_obj
             .as_any()
             .downcast_ref::<SuffixArrayQuery>()
             .ok_or_else(|| {
@@ -314,87 +323,11 @@ impl ScalarIndex for SuffixArrayIndex {
                 ))
             })?;
 
-        // Helper: lowercase bytes if the index was built case-insensitively.
-        // Only valid for UTF-8 text (not raw binary).
-        let maybe_lower = |bytes: &[u8]| -> Vec<u8> {
-            if self.case_insensitive {
-                String::from_utf8_lossy(bytes).to_lowercase().into_bytes()
-            } else {
-                bytes.to_vec()
-            }
-        };
-
-        match sa_query {
-            SuffixArrayQuery::Count { query_bytes } => {
-                let qb = maybe_lower(query_bytes);
-                let n = self.total_count(&qb).await?;
-                let mut map = RowAddrTreeMap::new();
-                if n > 0 {
-                    map.insert(n);
-                }
-                Ok(SearchResult::Exact(
-                    lance_core::utils::mask::NullableRowAddrSet::new(map, Default::default()),
-                ))
-            }
-            SuffixArrayQuery::Search {
-                query_bytes,
-                max_results,
-            } => {
-                let qb = maybe_lower(query_bytes);
-                let row_ids = self.search_rows(&qb, *max_results).await?;
-                let mut map = RowAddrTreeMap::new();
-                for row_id in &row_ids {
-                    map.insert(*row_id);
-                }
-                Ok(SearchResult::Exact(
-                    lance_core::utils::mask::NullableRowAddrSet::new(map, Default::default()),
-                ))
-            }
-            SuffixArrayQuery::Prob {
-                prompt_bytes,
-                continuation_bytes,
-            } => {
-                let pb = maybe_lower(prompt_bytes);
-                let cb = maybe_lower(continuation_bytes);
-                let result = self.compute_prob(&pb, &cb).await?;
-                let mut map = RowAddrTreeMap::new();
-                if result.cont_cnt > 0 {
-                    map.insert(result.cont_cnt);
-                }
-                Ok(SearchResult::Exact(
-                    lance_core::utils::mask::NullableRowAddrSet::new(map, Default::default()),
-                ))
-            }
-            SuffixArrayQuery::NextByteDistribution {
-                prompt_bytes,
-                max_support,
-            } => {
-                let pb = maybe_lower(prompt_bytes);
-                let result = self.compute_ntd(&pb, *max_support).await?;
-                let mut map = RowAddrTreeMap::new();
-                if result.prompt_cnt > 0 {
-                    map.insert(result.prompt_cnt);
-                }
-                Ok(SearchResult::Exact(
-                    lance_core::utils::mask::NullableRowAddrSet::new(map, Default::default()),
-                ))
-            }
-            SuffixArrayQuery::InfgramProb {
-                prompt_bytes,
-                continuation_bytes,
-            } => {
-                let pb = maybe_lower(prompt_bytes);
-                let cb = maybe_lower(continuation_bytes);
-                let result = self.compute_infgram_prob(&pb, &cb).await?;
-                let mut map = RowAddrTreeMap::new();
-                if result.prob_result.cont_cnt > 0 {
-                    map.insert(result.prob_result.cont_cnt);
-                }
-                Ok(SearchResult::Exact(
-                    lance_core::utils::mask::NullableRowAddrSet::new(map, Default::default()),
-                ))
-            }
-        }
+        let row_ids = self.search_rows(query_bytes, *max_results).await?;
+        let map = RowAddrTreeMap::from_iter(row_ids);
+        Ok(SearchResult::Exact(
+            lance_core::utils::mask::NullableRowAddrSet::new(map, Default::default()),
+        ))
     }
 
     fn can_remap(&self) -> bool {
@@ -411,23 +344,38 @@ impl ScalarIndex for SuffixArrayIndex {
         ))
     }
 
+    /// Rebuilds the whole index from `new_data`.
+    ///
+    /// Suffix arrays cannot be merged incrementally. [`Self::update_criteria`]
+    /// requests old data, so `new_data` already holds every live row of the
+    /// column (old and newly appended, with `_rowid`). Rows of deleted or
+    /// replaced fragments are not in the stream, so `old_data_filter` has
+    /// nothing left to filter.
     async fn update(
         &self,
-        _new_data: SendableRecordBatchStream,
-        _dest_store: &dyn IndexStore,
+        new_data: SendableRecordBatchStream,
+        dest_store: &dyn IndexStore,
         _old_data_filter: Option<OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
-        Err(Error::not_supported(
-            "Suffix array index update is not yet implemented; rebuild the index instead",
-        ))
+        let request = SuffixArrayTrainingRequest::new(self.build_params.clone());
+        SuffixArrayIndexPlugin
+            .train_index(
+                new_data,
+                dest_store,
+                Box::new(request),
+                None,
+                Arc::new(NoopIndexBuildProgress),
+            )
+            .await
     }
 
     fn update_criteria(&self) -> UpdateCriteria {
-        UpdateCriteria::requires_old_data(TrainingCriteria::new(TrainingOrdering::None))
+        // Same data as a fresh build: the rebuild in `update` needs `_rowid`.
+        UpdateCriteria::requires_old_data(TrainingCriteria::new(TrainingOrdering::None).with_row_id())
     }
 
     fn derive_index_params(&self) -> Result<ScalarIndexParams> {
-        Ok(ScalarIndexParams::new("suffixarray".to_string()))
+        Ok(ScalarIndexParams::new("suffixarray".to_string()).with_params(&self.build_params))
     }
 }
 
@@ -454,7 +402,20 @@ impl SuffixArrayIndex {
 
     /// Whether this index was built with case-insensitive (lowercased) text.
     pub fn case_insensitive(&self) -> bool {
-        self.case_insensitive
+        self.build_params.case_insensitive
+    }
+
+    /// Returns `bytes` as stored in the index: lowercased for case-insensitive
+    /// indices (their corpus was lowercased at build time), unchanged otherwise.
+    ///
+    /// Applied by every public query method, so callers pass the raw query.
+    /// Lowercasing is idempotent, so already-normalized input is unaffected.
+    fn normalize_query<'a>(&self, bytes: &'a [u8]) -> Cow<'a, [u8]> {
+        if self.build_params.case_insensitive {
+            Cow::Owned(String::from_utf8_lossy(bytes).to_lowercase().into_bytes())
+        } else {
+            Cow::Borrowed(bytes)
+        }
     }
 
     /// Token width (bytes per token unit). 1 = byte-level, 2 = int16, 4 = int32.
@@ -490,19 +451,19 @@ impl SuffixArrayIndex {
             store: Arc::new(NoopIndexStore),
             cache: weak_cache,
             preloaded: Some(preloaded),
-            case_insensitive: false,
+            build_params: SuffixArrayBuildParams::default(),
             token_width: 1,
         }
     }
 
     /// Load a single-segment SuffixArrayIndex lazily (v0 format).
-    pub async fn load(
+    pub(crate) async fn load(
         store: Arc<dyn IndexStore>,
         _frag_reuse_index: Option<Arc<FragReuseIndex>>,
         cache: &lance_core::cache::LanceCache,
         pointer_width: u8,
         total_entries: u64,
-        case_insensitive: bool,
+        build_params: SuffixArrayBuildParams,
         token_width: u8,
     ) -> Result<Arc<Self>> {
         Ok(Arc::new(Self {
@@ -520,17 +481,17 @@ impl SuffixArrayIndex {
             store,
             cache: WeakLanceCache::from(cache),
             preloaded: None,
-            case_insensitive,
+            build_params,
             token_width,
         }))
     }
 
     /// Load a multi-segment SuffixArrayIndex lazily (v1+ format).
     /// Eagerly loads bloom filters (~128 KB each) for fast segment skipping.
-    pub async fn load_multi(
+    pub(crate) async fn load_multi(
         store: Arc<dyn IndexStore>,
         segment_infos: &[crate::pb::SuffixArraySegmentInfo],
-        case_insensitive: bool,
+        build_params: SuffixArrayBuildParams,
         token_width: u8,
         cache: &lance_core::cache::LanceCache,
     ) -> Result<Arc<Self>> {
@@ -606,16 +567,19 @@ impl SuffixArrayIndex {
             store,
             cache: WeakLanceCache::from(cache),
             preloaded: None,
-            case_insensitive,
+            build_params,
             token_width,
         }))
     }
 
     /// Load one segment's files from the store.
     ///
-    /// Tries to load tokenized data as a raw file (block-cached) first.
-    /// Falls back to Lance format (full load) if raw file doesn't exist.
-    /// Suffix array is always fully loaded (~15 MB).
+    /// Reads the tokenized text and the suffix array through block-cached range
+    /// reads of their `.raw` files. Indices built before the raw format only
+    /// have the Lance `.bin` files; those are loaded fully into memory instead.
+    ///
+    /// This is a read path: it never writes to the store, so it works on
+    /// read-only stores and leaves the index files exactly as committed.
     async fn load_segment_from_store(
         store: &dyn IndexStore,
         meta: &SegmentMeta,
@@ -624,7 +588,8 @@ impl SuffixArrayIndex {
 
         // Load tokenized data — always produces a BlockCache.
         // If a .raw file exists, use lazy block reads from the store.
-        // If only .bin exists, load into memory and wrap as a pre-populated BlockCache.
+        // If only .bin exists (legacy index), load into memory and wrap as a
+        // pre-populated BlockCache.
         let raw_tok_name = meta.tok_filename.replace(".bin", ".raw");
         let (tokenized, tokenized_cache) = match store.raw_file_size(&raw_tok_name).await {
             Ok(size) => {
@@ -656,20 +621,6 @@ impl SuffixArrayIndex {
                         ))
                     })?;
                 let tokenized = Bytes::copy_from_slice(tokenized_col.value(0));
-
-                // Fire-and-forget: write .raw file so future queries use true block cache.
-                // Non-blocking — the query proceeds immediately with from_bytes cache.
-                {
-                    let store_bg = store_arc.clone();
-                    let raw_name = raw_tok_name.clone();
-                    let data = tokenized.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = store_bg.write_raw_file(&raw_name, &data).await {
-                            warn!(file = %raw_name, err = %e, "Failed to write tokenized .raw (non-fatal)");
-                        }
-                    });
-                }
-
                 let cache = super::block_cache::BlockCache::from_bytes(
                     store_arc.clone(),
                     meta.tok_filename.clone(),
@@ -682,7 +633,6 @@ impl SuffixArrayIndex {
         // Load suffix array — same strategy: always produces a BlockCache.
         // If a .raw file exists, use lazy block reads.
         // If only .bin exists, load into memory and wrap as a pre-populated BlockCache.
-        // Also writes a .raw file on first load so future queries use true block cache.
         let raw_sa_name = meta.sa_filename.replace(".bin", ".raw");
         let (suffix_array, sa_cache) = match store.raw_file_size(&raw_sa_name).await {
             Ok(size) => {
@@ -981,6 +931,8 @@ impl SuffixArrayIndex {
     /// Uses bloom filters to skip segments that definitely don't contain the query.
     /// Dispatches to sync or async (block-cached) path based on segment format.
     pub async fn total_count(&self, query: &[u8]) -> Result<u64> {
+        let query = self.normalize_query(query);
+        let query: &[u8] = &query;
         let tw = self.token_width as usize;
         let concurrency = parallel_query_concurrency(self.segment_metas.len());
 
@@ -1037,6 +989,8 @@ impl SuffixArrayIndex {
         query: &[u8],
         max_results: usize,
     ) -> Result<Vec<(u64, u32, Vec<u64>)>> {
+        let query = self.normalize_query(query);
+        let query: &[u8] = &query;
         let tw = self.token_width as usize;
         let concurrency = parallel_query_concurrency(self.segment_metas.len());
 
@@ -1342,6 +1296,9 @@ impl SuffixArrayIndex {
         prompt: &[u8],
         continuation: &[u8],
     ) -> Result<query::ProbResult> {
+        let prompt = self.normalize_query(prompt);
+        let continuation = self.normalize_query(continuation);
+        let (prompt, continuation): (&[u8], &[u8]) = (&prompt, &continuation);
         let prompt_cnt = self.total_count(prompt).await?;
         if prompt_cnt == 0 {
             return Ok(query::ProbResult {
@@ -1371,6 +1328,8 @@ impl SuffixArrayIndex {
         prompt: &[u8],
         max_support: Option<u64>,
     ) -> Result<query::NtdResult> {
+        let prompt = self.normalize_query(prompt);
+        let prompt: &[u8] = &prompt;
         let concurrency = parallel_query_concurrency(self.segment_metas.len());
 
         // Query all segments concurrently
@@ -1424,6 +1383,10 @@ impl SuffixArrayIndex {
         prompt: &[u8],
         continuation: &[u8],
     ) -> Result<query::InfgramProbResult> {
+        // Normalize before slicing suffixes: lowercasing can change UTF-8 lengths.
+        let prompt = self.normalize_query(prompt);
+        let continuation = self.normalize_query(continuation);
+        let (prompt, continuation): (&[u8], &[u8]) = (&prompt, &continuation);
         let prompt_len = prompt.len();
 
         if prompt_len == 0 {

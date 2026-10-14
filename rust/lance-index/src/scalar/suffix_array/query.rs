@@ -17,34 +17,20 @@ use lance_core::Result;
 
 use crate::scalar::AnyQuery;
 
-/// Query types supported by the suffix array index.
+/// Row-selection queries answered by [`ScalarIndex::search`](crate::scalar::ScalarIndex::search)
+/// on a suffix array index.
+///
+/// The search contract returns row addresses, so only queries that select rows
+/// belong here. Corpus statistics are exposed as methods on
+/// [`SuffixArrayIndex`](super::SuffixArrayIndex) instead: `total_count`,
+/// `compute_prob`, `compute_ntd` and `compute_infgram_prob`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SuffixArrayQuery {
-    /// Count the number of occurrences of a byte pattern in the corpus.
-    Count { query_bytes: Vec<u8> },
-    /// Search for documents containing a byte pattern, returning up to max_results.
+    /// Search for documents containing a byte pattern. Returns the row
+    /// addresses of up to `max_results` documents, most occurrences first.
     Search {
         query_bytes: Vec<u8>,
         max_results: usize,
-    },
-    /// Conditional probability: P(continuation | prompt) = count(prompt+cont) / count(prompt).
-    Prob {
-        prompt_bytes: Vec<u8>,
-        continuation_bytes: Vec<u8>,
-    },
-    /// Next-byte distribution: for each possible next byte after `prompt`,
-    /// returns the count and probability. Uses divide-and-conquer over the SA range.
-    NextByteDistribution {
-        prompt_bytes: Vec<u8>,
-        /// Maximum number of entries to scan before switching to approximate mode.
-        max_support: Option<u64>,
-    },
-    /// Infinity-gram probability with backoff.
-    /// Finds the longest suffix of `prompt` with nonzero count, then computes
-    /// P(continuation | longest_suffix).
-    InfgramProb {
-        prompt_bytes: Vec<u8>,
-        continuation_bytes: Vec<u8>,
     },
 }
 
@@ -54,51 +40,15 @@ impl AnyQuery for SuffixArrayQuery {
     }
 
     fn format(&self, col: &str) -> String {
-        match self {
-            Self::Count { query_bytes } => {
-                format!("sa_count({col}, [{} bytes])", query_bytes.len())
-            }
-            Self::Search {
-                query_bytes,
-                max_results,
-            } => {
-                format!(
-                    "sa_search({col}, [{} bytes], max={})",
-                    query_bytes.len(),
-                    max_results
-                )
-            }
-            Self::Prob {
-                prompt_bytes,
-                continuation_bytes,
-            } => {
-                format!(
-                    "sa_prob({col}, [{} bytes], [{} bytes])",
-                    prompt_bytes.len(),
-                    continuation_bytes.len()
-                )
-            }
-            Self::NextByteDistribution {
-                prompt_bytes,
-                max_support,
-            } => {
-                format!(
-                    "sa_ntd({col}, [{} bytes], max_support={:?})",
-                    prompt_bytes.len(),
-                    max_support
-                )
-            }
-            Self::InfgramProb {
-                prompt_bytes,
-                continuation_bytes,
-            } => {
-                format!(
-                    "sa_infgram_prob({col}, [{} bytes], [{} bytes])",
-                    prompt_bytes.len(),
-                    continuation_bytes.len()
-                )
-            }
-        }
+        let Self::Search {
+            query_bytes,
+            max_results,
+        } = self;
+        format!(
+            "sa_search({col}, [{} bytes], max={})",
+            query_bytes.len(),
+            max_results
+        )
     }
 
     fn to_expr(&self, col: String) -> Expr {
@@ -972,14 +922,17 @@ mod tests {
 
     #[test]
     fn test_suffix_array_query_equality() {
-        let q1 = SuffixArrayQuery::Count {
+        let q1 = SuffixArrayQuery::Search {
             query_bytes: vec![1, 2, 3],
+            max_results: 10,
         };
-        let q2 = SuffixArrayQuery::Count {
+        let q2 = SuffixArrayQuery::Search {
             query_bytes: vec![1, 2, 3],
+            max_results: 10,
         };
-        let q3 = SuffixArrayQuery::Count {
+        let q3 = SuffixArrayQuery::Search {
             query_bytes: vec![4, 5],
+            max_results: 10,
         };
 
         assert!(q1.dyn_eq(&q2));

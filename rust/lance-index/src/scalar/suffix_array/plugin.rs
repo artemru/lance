@@ -24,7 +24,7 @@ use futures::StreamExt;
 use lance_core::{Error, ROW_ID, Result};
 use prost::Message;
 use rayon::prelude::*;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use crate::frag_reuse::FragReuseIndex;
@@ -85,21 +85,35 @@ struct BuiltSegment {
 pub struct SuffixArrayIndexPlugin;
 
 /// Parameters parsed from the JSON params string for SA index creation.
-#[derive(Debug, Clone, Deserialize, Default)]
-struct SuffixArrayBuildParams {
+///
+/// Serialized back by [`SuffixArrayIndex::derive_index_params`](crate::scalar::ScalarIndex::derive_index_params)
+/// so that a rebuild keeps the original build options.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct SuffixArrayBuildParams {
     /// When true, lowercase all text at build time for case-insensitive matching.
     #[serde(default)]
-    case_insensitive: bool,
+    pub case_insensitive: bool,
     /// Separator token ID placed between documents in token-level indices.
     /// Defaults to 0xFFFF for u16 tokens and 0xFFFFFFFF for u32 tokens.
     #[serde(default)]
-    separator_token_id: Option<u32>,
+    pub separator_token_id: Option<u32>,
 }
 
 /// Training request that carries SA build parameters.
-struct SuffixArrayTrainingRequest {
+pub struct SuffixArrayTrainingRequest {
     criteria: TrainingCriteria,
     params: SuffixArrayBuildParams,
+}
+
+impl SuffixArrayTrainingRequest {
+    /// Build requests read the indexed column together with `_rowid`, which
+    /// maps each document back to its row.
+    pub fn new(params: SuffixArrayBuildParams) -> Self {
+        Self {
+            criteria: TrainingCriteria::new(TrainingOrdering::None).with_row_id(),
+            params,
+        }
+    }
 }
 
 impl TrainingRequest for SuffixArrayTrainingRequest {
@@ -113,56 +127,30 @@ impl TrainingRequest for SuffixArrayTrainingRequest {
 }
 
 /// Write one pre-built segment's (text, compact_sa, doc_offsets, row_ids) to the index store.
+///
+/// Files always use the segmented `segment_{N}_*` names: the index details
+/// always record a `segments` list, so readers load through
+/// [`SuffixArrayIndex::load_multi`], which expects those names.
 async fn write_segment(
     index_store: &dyn IndexStore,
     built: &BuiltSegment,
-    num_segments: usize,
 ) -> Result<pb::SuffixArraySegmentInfo> {
     let seg_idx = built.seg_idx;
+    let offsets_name = format!("segment_{seg_idx}_doc_offsets.bin");
+    let row_ids_name = format!("segment_{seg_idx}_row_ids.bin");
+    let bloom_name = format!("segment_{seg_idx}_bloom.bin");
 
-    // Choose file names: single-segment uses legacy names for backwards compat
-    let (tok_name, sa_name, offsets_name, row_ids_name, bloom_name) = if num_segments <= 1 {
-        (
-            "tokenized.bin".to_string(),
-            "suffix_array.bin".to_string(),
-            "doc_offsets.bin".to_string(),
-            "row_ids.bin".to_string(),
-            "bloom.bin".to_string(),
-        )
-    } else {
-        (
-            format!("segment_{seg_idx}_tokenized.bin"),
-            format!("segment_{seg_idx}_suffix_array.bin"),
-            format!("segment_{seg_idx}_doc_offsets.bin"),
-            format!("segment_{seg_idx}_row_ids.bin"),
-            format!("segment_{seg_idx}_bloom.bin"),
-        )
-    };
-
-    // Write tokenized text as Lance IPC format.
-    // The .raw file for block-cached reads is created lazily on first query,
-    // avoiding the 20 GB S3 upload during build (which doubled build time).
-    let tok_schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
-        "data",
-        arrow_schema::DataType::LargeBinary,
-        false,
-    )]));
-    let tok_batch = arrow_array::RecordBatch::try_new(
-        tok_schema.clone(),
-        vec![Arc::new(arrow_array::LargeBinaryArray::from(vec![built.text.as_slice()]))],
-    )?;
-    let mut tok_writer = index_store.new_index_file(&tok_name, tok_schema.clone()).await?;
-    tok_writer.write_record_batch(tok_batch).await?;
-    tok_writer.finish().await?;
-
-    // Write suffix array as raw bytes for block-cached queries.
-    // The .raw format enables 64 KB block-level S3 range reads instead
-    // of downloading the full 2 GB file. The metadata still references
-    // the .bin name; the load code derives .raw via .replace(".bin", ".raw")
-    // and tries it first, falling back to .bin for legacy indices.
-    let raw_sa_name = sa_name.replace(".bin", ".raw");
+    // The tokenized text and the suffix array are written as raw bytes so
+    // queries can fetch 64 KB blocks with range reads instead of downloading
+    // whole (multi-GB) files. The reader derives these `.raw` names from the
+    // `.bin` names kept in the segment metadata, and falls back to the Lance
+    // `.bin` files of indices built before the raw format. Both files are
+    // written here, at build time: the query path never writes to the store.
     index_store
-        .write_raw_file(&raw_sa_name, &built.compact_sa)
+        .write_raw_file(&format!("segment_{seg_idx}_tokenized.raw"), &built.text)
+        .await?;
+    index_store
+        .write_raw_file(&format!("segment_{seg_idx}_suffix_array.raw"), &built.compact_sa)
         .await?;
 
     // Write document offsets (u64 array, one per document)
@@ -501,10 +489,7 @@ impl ScalarIndexPlugin for SuffixArrayIndexPlugin {
                 ))
             })?
         };
-        Ok(Box::new(SuffixArrayTrainingRequest {
-            criteria: TrainingCriteria::new(TrainingOrdering::None).with_row_id(),
-            params: build_params,
-        }))
+        Ok(Box::new(SuffixArrayTrainingRequest::new(build_params)))
     }
 
     fn provides_exact_answer(&self) -> bool {
@@ -695,13 +680,8 @@ impl ScalarIndexPlugin for SuffixArrayIndexPlugin {
                 format!("SA builder task panicked: {e}"),
             ))??;
 
-            // Always use multi-segment naming (segment_N_*) since we're streaming
-            // and don't know the final segment count during writes.
-            // For single-segment results, we set num_segments=1 in metadata but
-            // still use multi-segment file naming, which load_multi handles.
-            let force_multi = 2; // Forces segment_N_ naming in write_segment
             for built in &built_batch {
-                let info = write_segment(index_store, built, force_multi).await?;
+                let info = write_segment(index_store, built).await?;
                 segment_infos.push(info);
             }
             drop(built_batch);
@@ -815,7 +795,7 @@ impl ScalarIndexPlugin for SuffixArrayIndexPlugin {
                 row_ids: Vec::new(),
                 bloom_bytes: Vec::new(),
             };
-            let info = write_segment(index_store, &empty_segment, 1).await?;
+            let info = write_segment(index_store, &empty_segment).await?;
             segment_infos.push(info);
         }
 
@@ -874,6 +854,10 @@ impl ScalarIndexPlugin for SuffixArrayIndexPlugin {
         cache: &lance_core::cache::LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
         let details = pb::SuffixArrayIndexDetails::decode(&*index_details.value)?;
+        let build_params = SuffixArrayBuildParams {
+            case_insensitive: details.case_insensitive,
+            separator_token_id: details.separator_token_id,
+        };
         let case_insensitive = details.case_insensitive;
         let token_width = details.token_width.max(1) as u8;
 
@@ -889,7 +873,7 @@ impl ScalarIndexPlugin for SuffixArrayIndexPlugin {
             Ok(SuffixArrayIndex::load_multi(
                 index_store,
                 &details.segments,
-                case_insensitive,
+                build_params,
                 token_width,
                 cache,
             ).await? as Arc<dyn ScalarIndex>)
@@ -903,7 +887,7 @@ impl ScalarIndexPlugin for SuffixArrayIndexPlugin {
                 cache,
                 pointer_width,
                 total_entries,
-                case_insensitive,
+                build_params,
                 token_width,
             )
             .await? as Arc<dyn ScalarIndex>)
@@ -913,10 +897,201 @@ impl ScalarIndexPlugin for SuffixArrayIndexPlugin {
 
 #[cfg(test)]
 mod tests {
+    use std::any::Any;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use arrow_array::{RecordBatch, StringArray, UInt64Array};
+    use arrow_schema::{DataType, Field, Schema};
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use datafusion::execution::SendableRecordBatchStream;
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use deepsize::DeepSizeOf;
+    use futures::stream;
+    use lance_core::Result;
+    use lance_core::cache::LanceCache;
+    use lance_core::utils::tempfile::TempDir;
+    use lance_io::object_store::ObjectStore;
+
+    use super::{SuffixArrayBuildParams, SuffixArrayIndexPlugin};
+    use crate::metrics::NoOpMetricsCollector;
+    use crate::progress::NoopIndexBuildProgress;
+    use crate::scalar::lance_format::LanceIndexStore;
+    use crate::scalar::registry::{ScalarIndexPlugin, VALUE_COLUMN_NAME};
     use crate::scalar::suffix_array::builder::{
         build_suffix_array, compact_suffix_array, compute_pointer_width,
     };
     use crate::scalar::suffix_array::query;
+    use crate::scalar::suffix_array::{SuffixArrayIndex, SuffixArrayQuery};
+    use crate::scalar::{
+        CreatedIndex, IndexFile, IndexReader, IndexStore, IndexWriter, ScalarIndex, SearchResult,
+    };
+
+    /// One batch of (`value`, `_rowid`) training data; row ids start at `first_row_id`.
+    fn text_stream(texts: &[&str], first_row_id: u64) -> SendableRecordBatchStream {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(VALUE_COLUMN_NAME, DataType::Utf8, false),
+            Field::new("_rowid", DataType::UInt64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(texts.to_vec())),
+                Arc::new(UInt64Array::from_iter_values(
+                    first_row_id..first_row_id + texts.len() as u64,
+                )),
+            ],
+        )
+        .unwrap();
+        Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::once(std::future::ready(Ok(batch))),
+        ))
+    }
+
+    fn local_store(dir: &TempDir) -> Arc<LanceIndexStore> {
+        Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            dir.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        ))
+    }
+
+    async fn train(texts: &[&str], params: &str, store: &dyn IndexStore) -> CreatedIndex {
+        let plugin = SuffixArrayIndexPlugin;
+        let field = Field::new(VALUE_COLUMN_NAME, DataType::Utf8, false);
+        let request = plugin.new_training_request(params, &field).unwrap();
+        plugin
+            .train_index(
+                text_stream(texts, 0),
+                store,
+                request,
+                None,
+                Arc::new(NoopIndexBuildProgress),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn load(created: &CreatedIndex, store: Arc<dyn IndexStore>) -> Arc<dyn ScalarIndex> {
+        SuffixArrayIndexPlugin
+            .load_index(store, &created.index_details, None, &LanceCache::no_cache())
+            .await
+            .unwrap()
+    }
+
+    fn as_suffix_array(index: &Arc<dyn ScalarIndex>) -> &SuffixArrayIndex {
+        index.as_any().downcast_ref::<SuffixArrayIndex>().unwrap()
+    }
+
+    /// Row addresses returned by `ScalarIndex::search` for `pattern`.
+    async fn search_rows(index: &dyn ScalarIndex, pattern: &[u8]) -> Vec<u64> {
+        let query = SuffixArrayQuery::Search {
+            query_bytes: pattern.to_vec(),
+            max_results: 100,
+        };
+        match index.search(&query, &NoOpMetricsCollector).await.unwrap() {
+            SearchResult::Exact(rows) => rows
+                .true_rows()
+                .row_addrs()
+                .unwrap()
+                .map(u64::from)
+                .collect(),
+            other => panic!("expected an exact result, got {other:?}"),
+        }
+    }
+
+    async fn file_names(store: &dyn IndexStore) -> Vec<String> {
+        let mut names: Vec<String> = store
+            .list_files_with_sizes()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|f| f.path)
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Store that serves reads from `inner` and rejects every write, counting
+    /// the attempts — a read-only object store as seen by the index.
+    #[derive(Debug)]
+    struct ReadOnlyStore {
+        inner: Arc<dyn IndexStore>,
+        write_attempts: Arc<AtomicUsize>,
+    }
+
+    impl DeepSizeOf for ReadOnlyStore {
+        fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+            0
+        }
+    }
+
+    impl ReadOnlyStore {
+        fn reject_write(&self, name: &str) -> lance_core::Error {
+            self.write_attempts.fetch_add(1, Ordering::SeqCst);
+            lance_core::Error::not_supported(format!("read-only store: refused to write {name}"))
+        }
+    }
+
+    #[async_trait]
+    impl IndexStore for ReadOnlyStore {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn clone_arc(&self) -> Arc<dyn IndexStore> {
+            Arc::new(Self {
+                inner: self.inner.clone(),
+                write_attempts: self.write_attempts.clone(),
+            })
+        }
+
+        fn io_parallelism(&self) -> usize {
+            self.inner.io_parallelism()
+        }
+
+        async fn new_index_file(
+            &self,
+            name: &str,
+            _schema: Arc<Schema>,
+        ) -> Result<Box<dyn IndexWriter>> {
+            Err(self.reject_write(name))
+        }
+
+        async fn open_index_file(&self, name: &str) -> Result<Arc<dyn IndexReader>> {
+            self.inner.open_index_file(name).await
+        }
+
+        async fn copy_index_file(&self, name: &str, _dest_store: &dyn IndexStore) -> Result<()> {
+            Err(self.reject_write(name))
+        }
+
+        async fn rename_index_file(&self, name: &str, _new_name: &str) -> Result<()> {
+            Err(self.reject_write(name))
+        }
+
+        async fn delete_index_file(&self, name: &str) -> Result<()> {
+            Err(self.reject_write(name))
+        }
+
+        async fn list_files_with_sizes(&self) -> Result<Vec<IndexFile>> {
+            self.inner.list_files_with_sizes().await
+        }
+
+        async fn write_raw_file(&self, name: &str, _data: &[u8]) -> Result<()> {
+            Err(self.reject_write(name))
+        }
+
+        async fn read_raw_range(&self, name: &str, range: std::ops::Range<usize>) -> Result<Bytes> {
+            self.inner.read_raw_range(name, range).await
+        }
+
+        async fn raw_file_size(&self, name: &str) -> Result<usize> {
+            self.inner.raw_file_size(name).await
+        }
+    }
 
     #[test]
     fn test_sa_construction_small() {
@@ -987,154 +1162,143 @@ mod tests {
 
     #[test_log::test(tokio::test)]
     async fn test_train_load_query_roundtrip() {
-        use std::sync::Arc;
+        let tmpdir = TempDir::default();
+        let store = local_store(&tmpdir);
+        let created = train(
+            &["the quick brown fox", "jumps over the lazy dog", "the cat sat on the mat"],
+            "",
+            store.as_ref(),
+        )
+        .await;
 
-        use arrow_array::{RecordBatch, StringArray, UInt64Array};
-        use arrow_schema::{DataType, Field, Schema};
-        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-        use futures::stream;
-        use lance_core::cache::LanceCache;
-        use lance_core::utils::tempfile::TempDir;
-        use lance_io::object_store::ObjectStore;
+        // Both large blobs are raw files written at build time (block-cached
+        // reads); no tokenized Lance file is written.
+        let names = file_names(store.as_ref()).await;
+        assert!(names.contains(&"segment_0_tokenized.raw".to_string()), "{names:?}");
+        assert!(names.contains(&"segment_0_suffix_array.raw".to_string()), "{names:?}");
+        assert!(!names.iter().any(|n| n.ends_with("tokenized.bin")), "{names:?}");
 
-        use crate::metrics::NoOpMetricsCollector;
-        use crate::progress::NoopIndexBuildProgress;
-        use crate::scalar::lance_format::LanceIndexStore;
-        use crate::scalar::registry::{ScalarIndexPlugin, VALUE_COLUMN_NAME};
+        let index = load(&created, store.clone()).await;
+        let sa = as_suffix_array(&index);
+        assert_eq!(sa.total_count(b"the").await.unwrap(), 4);
+        assert_eq!(sa.total_count(b"xyz").await.unwrap(), 0);
 
-        use super::super::query::SuffixArrayQuery;
-        use super::SuffixArrayIndexPlugin;
+        // `search` returns the row addresses of the matching documents.
+        assert_eq!(search_rows(index.as_ref(), b"fox").await, vec![0]);
+        assert_eq!(search_rows(index.as_ref(), b"the").await, vec![0, 1, 2]);
+        assert!(search_rows(index.as_ref(), b"xyz").await.is_empty());
+    }
 
-        let texts = vec![
-            "the quick brown fox",
-            "jumps over the lazy dog",
-            "the cat sat on the mat",
-        ];
-        let text_array = StringArray::from(texts.clone());
-        let row_ids = UInt64Array::from_iter_values(0..3u64);
-        let schema = Arc::new(Schema::new(vec![
-            Field::new(VALUE_COLUMN_NAME, DataType::Utf8, false),
-            Field::new("_rowid", DataType::UInt64, false),
-        ]));
+    #[test_log::test(tokio::test)]
+    async fn test_empty_index_roundtrip() {
+        let tmpdir = TempDir::default();
+        let store = local_store(&tmpdir);
+        let created = train(&[], "", store.as_ref()).await;
 
+        // An empty build still writes segment 0 under the segmented names
+        // that the loader expects.
+        let names = file_names(store.as_ref()).await;
+        for expected in [
+            "segment_0_tokenized.raw",
+            "segment_0_suffix_array.raw",
+            "segment_0_doc_offsets.bin",
+            "segment_0_row_ids.bin",
+        ] {
+            assert!(names.contains(&expected.to_string()), "missing {expected}: {names:?}");
+        }
+
+        let index = load(&created, store.clone()).await;
+        let sa = as_suffix_array(&index);
+        assert_eq!(sa.total_count(b"anything").await.unwrap(), 0);
+        assert!(search_rows(index.as_ref(), b"anything").await.is_empty());
+        assert_eq!(sa.compute_prob(b"a", b"b").await.unwrap().cont_cnt, 0);
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_query_legacy_index_never_writes() {
+        // Indices built before the raw format store the tokenized text only as
+        // a Lance `.bin` file. Querying them must not write anything to the
+        // store (e.g. a raw sidecar): reads must work on read-only stores.
+        let tmpdir = TempDir::default();
+        let store = local_store(&tmpdir);
+        let created = train(&["the quick brown fox", "the lazy dog"], "", store.as_ref()).await;
+
+        let raw_name = "segment_0_tokenized.raw";
+        let size = store.raw_file_size(raw_name).await.unwrap();
+        let text = store.read_raw_range(raw_name, 0..size).await.unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("data", DataType::LargeBinary, false)]));
         let batch = RecordBatch::try_new(
             schema.clone(),
-            vec![Arc::new(text_array), Arc::new(row_ids)],
+            vec![Arc::new(arrow_array::LargeBinaryArray::from(vec![text.as_ref()]))],
         )
         .unwrap();
+        let mut writer = store.new_index_file("segment_0_tokenized.bin", schema).await.unwrap();
+        writer.write_record_batch(batch).await.unwrap();
+        writer.finish().await.unwrap();
+        store.delete_index_file(raw_name).await.unwrap();
+        let files_before = file_names(store.as_ref()).await;
 
-        let data_stream = Box::pin(RecordBatchStreamAdapter::new(
-            schema.clone(),
-            stream::once(std::future::ready(Ok(batch))),
-        ));
+        let write_attempts = Arc::new(AtomicUsize::new(0));
+        let read_only = Arc::new(ReadOnlyStore {
+            inner: store.clone(),
+            write_attempts: write_attempts.clone(),
+        });
+        let index = load(&created, read_only).await;
+        let sa = as_suffix_array(&index);
+        assert_eq!(sa.total_count(b"the").await.unwrap(), 2);
+        assert_eq!(search_rows(index.as_ref(), b"fox").await, vec![0]);
 
-        let plugin = SuffixArrayIndexPlugin;
-        let field = Field::new(VALUE_COLUMN_NAME, DataType::Utf8, false);
-        let request = plugin.new_training_request("", &field).unwrap();
+        // Let any task spawned by the query path run before checking.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(write_attempts.load(Ordering::SeqCst), 0);
+        assert_eq!(file_names(store.as_ref()).await, files_before);
+    }
 
-        let tmpdir = Arc::new(TempDir::default());
-        let store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
-            tmpdir.obj_path(),
-            Arc::new(LanceCache::no_cache()),
-        ));
+    #[test_log::test(tokio::test)]
+    async fn test_update_rebuilds_with_original_params() {
+        let old_texts = ["The quick brown Fox", "a lazy dog"];
+        let tmpdir = TempDir::default();
+        let store = local_store(&tmpdir);
+        let created = train(&old_texts, r#"{"case_insensitive": true}"#, store.as_ref()).await;
+        let index = load(&created, store.clone()).await;
 
-        let progress = Arc::new(NoopIndexBuildProgress);
-        let created = plugin
-            .train_index(data_stream, store.as_ref(), request, None, progress)
+        // The derived params keep the build options, so a rebuild through
+        // `build_scalar_index` stays case-insensitive.
+        let derived = index.derive_index_params().unwrap();
+        assert_eq!(derived.index_type, "suffixarray");
+        let params: SuffixArrayBuildParams =
+            serde_json::from_str(derived.params.as_deref().unwrap()).unwrap();
+        assert!(params.case_insensitive);
+
+        // `update` receives every live row (old and appended) with `_rowid`,
+        // as requested by `update_criteria`, and rebuilds the index from it.
+        let criteria = index.update_criteria();
+        assert!(criteria.requires_old_data);
+        assert!(criteria.data_criteria.needs_row_ids);
+        let all_texts = [old_texts[0], old_texts[1], "ANOTHER FOX, a new one"];
+        let new_dir = TempDir::default();
+        let new_store = local_store(&new_dir);
+        let updated = index
+            .update(text_stream(&all_texts, 0), new_store.as_ref(), None)
             .await
             .unwrap();
-
-        assert!(created.files.is_some());
-        let files = created.files.as_ref().unwrap();
-        assert!(files.iter().any(|f| f.path.contains("tokenized")));
-        assert!(files.iter().any(|f| f.path.contains("suffix_array")));
-
-        let loaded_index = plugin
-            .load_index(
-                store.clone(),
-                &created.index_details,
-                None,
-                &LanceCache::no_cache(),
-            )
-            .await
-            .unwrap();
-
-        let metrics = NoOpMetricsCollector;
-
-        // Count "the" — should appear 4 times
-        let count_query = SuffixArrayQuery::Count {
-            query_bytes: b"the".to_vec(),
-        };
-        let result = loaded_index.search(&count_query, &metrics).await.unwrap();
-        match &result {
-            crate::scalar::SearchResult::Exact(row_set) => {
-                let row_addrs: Vec<u64> = row_set
-                    .true_rows()
-                    .row_addrs()
-                    .unwrap()
-                    .map(|addr| addr.into())
-                    .collect();
-                assert!(!row_addrs.is_empty(), "Expected count > 0 for 'the' query");
-            }
-            other => panic!("Expected Exact result, got {:?}", other),
-        }
-
-        // Count "xyz" — should not appear
-        let count_query = SuffixArrayQuery::Count {
-            query_bytes: b"xyz".to_vec(),
-        };
-        let result = loaded_index.search(&count_query, &metrics).await.unwrap();
-        match &result {
-            crate::scalar::SearchResult::Exact(row_set) => {
-                let row_addrs: Vec<u64> = row_set
-                    .true_rows()
-                    .row_addrs()
-                    .unwrap()
-                    .map(|addr| addr.into())
-                    .collect();
-                assert!(row_addrs.is_empty(), "Expected count = 0 for 'xyz' query");
-            }
-            other => panic!("Expected Exact result, got {:?}", other),
-        }
-
-        // Search for positions of "fox"
-        let search_query = SuffixArrayQuery::Search {
-            query_bytes: b"fox".to_vec(),
-            max_results: 10,
-        };
-        let result = loaded_index.search(&search_query, &metrics).await.unwrap();
-        match &result {
-            crate::scalar::SearchResult::Exact(row_set) => {
-                let row_addrs: Vec<u64> = row_set
-                    .true_rows()
-                    .row_addrs()
-                    .unwrap()
-                    .map(|addr| addr.into())
-                    .collect();
-                assert_eq!(
-                    row_addrs.len(),
-                    1,
-                    "Expected exactly 1 match for 'fox', got {:?}",
-                    row_addrs
-                );
-            }
-            other => panic!("Expected Exact result, got {:?}", other),
-        }
+        let updated = load(&updated, new_store.clone()).await;
+        let sa = as_suffix_array(&updated);
+        assert!(sa.case_insensitive());
+        // Queries are normalized by the index itself, whatever their case.
+        assert_eq!(sa.total_count(b"FOX").await.unwrap(), 2);
+        assert_eq!(sa.total_count(b"fox").await.unwrap(), 2);
+        assert_eq!(sa.compute_prob(b"A NEW ", b"ONE").await.unwrap().cont_cnt, 1);
+        assert_eq!(search_rows(updated.as_ref(), b"New").await, vec![2]);
     }
 
     #[test_log::test(tokio::test)]
     async fn test_multi_segment_roundtrip() {
         // Verify that a multi-segment index produces the same counts as a
         // single-segment index over the same corpus.
-        use bytes::Bytes;
-
-        use crate::metrics::NoOpMetricsCollector;
-        use crate::scalar::ScalarIndex;
-
-        use super::super::builder::{build_suffix_array, compact_suffix_array, compute_pointer_width};
-        use super::super::index::{SuffixArrayIndex, SuffixArraySegment};
-        use super::super::query::SuffixArrayQuery;
+        use crate::scalar::suffix_array::SuffixArraySegment;
 
         // Build a corpus split across two segments
         let text1 = b"the cat sat on the mat";
@@ -1200,24 +1364,9 @@ mod tests {
         assert_eq!(igp.prob_result.cont_cnt, 1);
         assert_eq!(igp.effective_suffix_len, 4);
 
-        // Test via ScalarIndex::search
-        let metrics = NoOpMetricsCollector;
-        let count_query = SuffixArrayQuery::Count {
-            query_bytes: b"the".to_vec(),
-        };
-        let result = index.search(&count_query, &metrics).await.unwrap();
-        match &result {
-            crate::scalar::SearchResult::Exact(row_set) => {
-                let count: u64 = row_set
-                    .true_rows()
-                    .row_addrs()
-                    .unwrap()
-                    .map(u64::from)
-                    .sum();
-                assert_eq!(count, 4, "Expected 4 occurrences of 'the' across 2 segments");
-            }
-            other => panic!("Expected Exact result, got {:?}", other),
-        }
+        // `search` returns the matching documents' row addresses across segments.
+        assert_eq!(search_rows(&index, b"the").await, vec![0, 1]);
+        assert_eq!(search_rows(&index, b"park").await, vec![1]);
     }
 
     #[test]

@@ -887,7 +887,7 @@ class LanceDataset(pa.dataset.Dataset):
         continuation : str or bytes, optional
             Required for "prob" and "infgram_prob" operations.
         max_results : int, optional
-            For "search" operation: max positions to return.
+            For "search" operation: max rows to return.
         max_support : int, optional
             For "ntd" operation: max entries to scan before approximate mode.
 
@@ -896,7 +896,8 @@ class LanceDataset(pa.dataset.Dataset):
         dict
             Result dictionary whose contents depend on the operation:
             - ``count``: {"count": int}
-            - ``search``: {"positions": list[int]}
+            - ``search``: {"row_addrs": list[int]}, row addresses of the rows
+              whose text contains the pattern
             - ``prob``: {"prompt_cnt": int, "cont_cnt": int, "prob": float}
             - ``ntd``: {"prompt_cnt": int, "approximate": bool,
               "distribution": list[dict]}
@@ -910,10 +911,8 @@ class LanceDataset(pa.dataset.Dataset):
             n = self._ds.suffix_array_count(index_name, query)
             return {"count": n}
         elif operation == "search":
-            positions = self._ds.suffix_array_search(
-                index_name, query, max_results
-            )
-            return {"positions": positions}
+            row_addrs = self._ds.suffix_array_search(index_name, query, max_results)
+            return {"row_addrs": row_addrs}
         elif operation == "prob":
             if continuation is None:
                 raise ValueError("continuation is required for 'prob' operation")

@@ -1882,11 +1882,16 @@ impl Scanner {
         }
 
         if self.infgram_query.is_some() {
-            extra_columns.push(ArrowField::new(
-                crate::io::exec::infgram::COUNT_COL,
-                DataType::Float32,
-                true,
-            ));
+            // Expose exactly the result columns the infgram exec emits (`_count`,
+            // `_positions`), with its types, so projections, filters and orderings
+            // are planned against the real output schema.
+            extra_columns.extend(
+                crate::io::exec::infgram::INFGRAM_SCHEMA
+                    .fields()
+                    .iter()
+                    .filter(|field| field.name() != ROW_ID)
+                    .map(|field| field.as_ref().clone()),
+            );
         }
 
         schema.merge(&ArrowSchema::new(extra_columns))
@@ -11180,5 +11185,71 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             scanner
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn test_infgram_search_planning_schema_matches_output() {
+        use crate::io::exec::infgram::{COUNT_COL, POSITIONS_COL};
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "text",
+            DataType::Utf8,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(arrow_array::StringArray::from(vec![
+                "the fox",
+                "a fox and a fox",
+                "a dog",
+            ]))],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            "memory://",
+            None,
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["text"],
+                IndexType::SuffixArray,
+                Some("sa_idx".into()),
+                &ScalarIndexParams::new("suffixarray".to_string()),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let mut scan = dataset.scan();
+        scan.infgram_search(InfgramSearchQuery::new("fox".to_string()))
+            .unwrap();
+        scan.project(&["text", COUNT_COL, POSITIONS_COL]).unwrap();
+
+        // Filters and projections are planned against this schema: it must
+        // carry the result columns with the types the infgram exec emits.
+        let planning = scan.filterable_schema().unwrap();
+        let output = scan.try_into_batch().await.unwrap();
+        assert_eq!(output.num_rows(), 2);
+        let planned = ArrowSchema::from(planning.as_ref());
+        for name in [COUNT_COL, POSITIONS_COL] {
+            assert_eq!(
+                planned.field_with_name(name).unwrap().data_type(),
+                output.schema().field_with_name(name).unwrap().data_type(),
+                "column {name}"
+            );
+        }
+        assert_eq!(
+            output.schema().field_with_name(COUNT_COL).unwrap().data_type(),
+            &DataType::UInt32
+        );
+        let mut counts: Vec<u32> = output[COUNT_COL]
+            .as_primitive::<arrow_array::types::UInt32Type>()
+            .values()
+            .to_vec();
+        counts.sort_unstable();
+        assert_eq!(counts, vec![1, 2]);
     }
 }

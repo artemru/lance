@@ -4817,31 +4817,26 @@ def test_suffix_array_index(tmp_path: Path):
     assert len(indices) == 1
     assert indices[0].index_type == "SuffixArray"
 
-    # Count occurrences of "the" across all documents
-    count = dataset.suffix_array_count("sa_idx", "the")
+    def count(pattern):
+        return dataset._suffix_array_info("sa_idx", pattern)["count"]
+
+    def search(pattern, max_results):
+        result = dataset._suffix_array_info(
+            "sa_idx", pattern, operation="search", max_results=max_results
+        )
+        return result["row_addrs"]
+
     # "the quick brown fox" (1), "the lazy dog" (1),
     # "the cat" (1), "the mat" (1) = 4 total
-    assert count == 4, f"Expected 4 occurrences of 'the', got {count}"
+    assert count("the") == 4
+    assert count("xyz") == 0
+    # bytes input
+    assert count(b"fox") == 2
 
-    # Count something that doesn't exist
-    count = dataset.suffix_array_count("sa_idx", "xyz")
-    assert count == 0, f"Expected 0 occurrences of 'xyz', got {count}"
-
-    # Count with bytes input
-    count = dataset.suffix_array_count("sa_idx", b"fox")
-    assert count == 2, f"Expected 2 occurrences of 'fox', got {count}"
-
-    # Search for positions of "quick"
-    positions = dataset.suffix_array_search("sa_idx", "quick", max_results=10)
-    assert len(positions) == 3, (
-        f"Expected 3 positions for 'quick', got {len(positions)}"
-    )
-
-    # Search with max_results limit
-    positions = dataset.suffix_array_search("sa_idx", "quick", max_results=1)
-    assert len(positions) == 1, (
-        f"Expected 1 position for 'quick' with max_results=1, got {len(positions)}"
-    )
+    # Search returns the row addresses of the rows containing the pattern:
+    # "quick" occurs in rows 0 and 2.
+    assert sorted(search("quick", max_results=10)) == [0, 2]
+    assert len(search("quick", max_results=1)) == 1
 
 
 @pytest.mark.parametrize(
@@ -4858,8 +4853,7 @@ def test_suffix_array_index_field_types(tmp_path: Path, field_type):
     tbl = pa.Table.from_arrays([data], names=["col"])
     dataset = lance.write_dataset(tbl, tmp_path / "dataset", mode="overwrite")
     dataset.create_scalar_index("col", index_type="SUFFIX_ARRAY", name="sa_idx")
-    count = dataset.suffix_array_count("sa_idx", b"hello")
-    assert count == 2
+    assert dataset._suffix_array_info("sa_idx", b"hello")["count"] == 2
 
 
 def test_suffix_array_index_rejects_invalid_type(tmp_path: Path):

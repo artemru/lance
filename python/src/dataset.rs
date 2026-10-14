@@ -966,25 +966,18 @@ impl Dataset {
                     &NoOpMetricsCollector,
                 )
                 .await?;
-            let sa_query = SuffixArrayQuery::Count { query_bytes: query };
-            let result = index.search(&sa_query, &NoOpMetricsCollector).await?;
-            match result {
-                lance_index::scalar::SearchResult::Exact(row_set) => {
-                    // Count is encoded as a synthetic row address
-                    let count: u64 = row_set
-                        .true_rows()
-                        .row_addrs()
-                        .map(|addrs| addrs.map(u64::from).sum())
-                        .unwrap_or(0);
-                    Ok(count)
-                }
-                _ => Ok(0),
-            }
+            let sa_index = index
+                .as_any()
+                .downcast_ref::<lance_index::scalar::suffix_array::SuffixArrayIndex>()
+                .ok_or_else(|| {
+                    lance::Error::invalid_input("Index is not a SuffixArrayIndex")
+                })?;
+            sa_index.total_count(&query).await
         })?
         .map_err(|err| PyIOError::new_err(format!("Suffix array count failed: {}", err)))
     }
 
-    /// Search for positions of a byte pattern in a suffix array index.
+    /// Search for rows whose text contains a byte pattern, using a suffix array index.
     ///
     /// Parameters
     /// ----------
@@ -993,12 +986,12 @@ impl Dataset {
     /// query : bytes
     ///     Byte pattern to search for.
     /// max_results : int, optional
-    ///     Maximum number of positions to return. Default 100.
+    ///     Maximum number of rows to return. Default 100.
     ///
     /// Returns
     /// -------
     /// list[int]
-    ///     Byte positions within the corpus where the pattern occurs.
+    ///     Row addresses of the matching rows, sorted ascending.
     fn suffix_array_search(
         &self,
         index_name: String,
