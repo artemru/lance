@@ -1451,6 +1451,45 @@ def test_use_multi_index(tmp_path):
     )
 
 
+@pytest.mark.parametrize("value_type", [pa.string(), pa.large_string()])
+def test_fm_index(tmp_path: Path, value_type):
+    words = ["apple", "apples", "banana", "coconut"]
+    tbl = pa.table({"words": pa.array([words[i % 4] for i in range(100)], value_type)})
+    dataset = lance.write_dataset(tbl, tmp_path / "dataset", max_rows_per_file=40)
+    dataset.create_scalar_index("words", index_type="FM")
+
+    indices = dataset.describe_indices()
+    assert len(indices) == 1
+    assert indices[0].index_type == "Fm"
+    plan = dataset.scanner(filter="contains(words, 'apple')").explain_plan(True)
+    assert "ScalarIndexQuery: query=[contains(words" in plan
+
+    def count(needle):
+        return dataset.to_table(filter=f"contains(words, '{needle}')").num_rows
+
+    assert count("apple") == 50
+    assert count("apples") == 25
+    # Needles shorter than an ngram are answered by the index too.
+    assert count("pp") == 50
+    assert count("co") == 25
+    assert count("durian") == 0
+
+
+def test_fm_index_segments(tmp_path: Path):
+    tbl = pa.table({"words": [f"word{i}" for i in range(100)]})
+    dataset = lance.write_dataset(tbl, tmp_path / "dataset", max_rows_per_file=20)
+    dataset.create_scalar_index("words", index_type="FM", num_segments=2)
+
+    assert dataset.to_table(filter="contains(words, 'word1')").num_rows == 11
+    assert dataset.to_table(filter="contains(words, 'word99')").num_rows == 1
+
+
+def test_fm_index_rejects_non_text_column(tmp_path: Path):
+    dataset = lance.write_dataset(pa.table({"x": [1, 2, 3]}), tmp_path / "dataset")
+    with pytest.raises(TypeError, match="FM index column x must be string or binary"):
+        dataset.create_scalar_index("x", index_type="FM")
+
+
 def test_ngram_fts(tmp_path):
     dataset = lance.write_dataset(
         pa.table({"text": ["hello", "world", "hello world"]}),

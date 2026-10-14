@@ -3576,12 +3576,13 @@ class LanceDataset(pa.dataset.Dataset):
                 "FTS",
                 "BLOOMFILTER",
                 "RTREE",
+                "FM",
             ]:
                 raise NotImplementedError(
                     (
                         'Only "BTREE", "BITMAP", "NGRAM", "ZONEMAP", "LABEL_LIST", '
-                        '"INVERTED", "BLOOMFILTER" or "RTREE" are supported for '
-                        f"scalar columns.  Received {index_type}",
+                        '"INVERTED", "BLOOMFILTER", "RTREE" or "FM" are supported '
+                        f"for scalar columns.  Received {index_type}",
                     )
                 )
 
@@ -3629,6 +3630,17 @@ class LanceDataset(pa.dataset.Dataset):
                     field_type
                 ):
                     raise TypeError(f"NGRAM index column {column} must be a string")
+            elif index_type == "FM":
+                if not (
+                    pa.types.is_string(field_type)
+                    or pa.types.is_large_string(field_type)
+                    or pa.types.is_binary(field_type)
+                    or pa.types.is_large_binary(field_type)
+                ):
+                    raise TypeError(
+                        f"FM index column {column} must be string or binary, "
+                        f"but got {field_type}"
+                    )
             elif index_type in ["INVERTED", "FTS"]:
                 value_type = field_type
                 if pa.types.is_list(field_type) or pa.types.is_large_list(field_type):
@@ -3713,6 +3725,7 @@ class LanceDataset(pa.dataset.Dataset):
             Literal["ZONEMAP"],
             Literal["BLOOMFILTER"],
             Literal["RTREE"],
+            Literal["FM"],
             IndexConfig,
         ],
         name: Optional[str] = None,
@@ -3789,6 +3802,10 @@ class LanceDataset(pa.dataset.Dataset):
         * ``BLOOMFILTER``. This inexact index uses a bloom filter.  It is small
              but can only handle filters with equals and not equals and may require
              more I/O than a btree or bitmap index```
+        * ``FM``. An exact substring index (FM-index) for string and binary
+          columns. It speeds up ``contains`` filters for substrings of any
+          length and needs no recheck. It is about the size of the indexed text.
+          This index is experimental.
 
         Index training sorts can spill to disk under memory pressure.
         ``LANCE_MEM_POOL_SIZE`` configures this pool in bytes; it is not a limit
@@ -3817,7 +3834,7 @@ class LanceDataset(pa.dataset.Dataset):
         index_type : str
             The type of the index.  One of ``"BTREE"``, ``"BITMAP"``,
             ``"LABEL_LIST"``, ``"NGRAM"``, ``"ZONEMAP"``, ``"INVERTED"``,
-            ``"FTS"``, ``"BLOOMFILTER"``, ``"RTREE"``.
+            ``"FTS"``, ``"BLOOMFILTER"``, ``"RTREE"``, ``"FM"``.
         name : str, optional
             The index name. If not provided, it will be generated from the
             column name.
@@ -3915,6 +3932,9 @@ class LanceDataset(pa.dataset.Dataset):
             This is for the ``INVERTED`` index. If True, the index will convert
             non-ascii characters to ascii characters if possible.
             This would remove accents like "é" -> "e".
+        num_segments: int, optional
+            This is for the ``FM`` index. Split the dataset's fragments into this
+            many groups and build one index segment per group.
 
         Examples
         --------
